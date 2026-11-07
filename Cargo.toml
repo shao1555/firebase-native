@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/firebase-native",
+    "crates/firebase-native-core",
+    "crates/firebase-native-auth",
+    "crates/firebase-native-firestore",
+    "crates/firebase-native-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["Sho Sawada"]
+homepage = "https://github.com/shao1555/firebase-native"
+repository = "https://github.com/shao1555/firebase-native"
+
+[workspace.dependencies]
+firebase-native-core = { path = "crates/firebase-native-core", version = "0.1.0" }
+firebase-native-auth = { path = "crates/firebase-native-auth", version = "0.1.0" }
+firebase-native-firestore = { path = "crates/firebase-native-firestore", version = "0.1.0" }
+firebase-native-storage = { path = "crates/firebase-native-storage", version = "0.1.0" }
+
+async-trait = "0.1"
+bytes = "1"
+prost = "0.13"
+prost-types = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.12", features = ["tls-roots"] }
