@@ -1,0 +1,32 @@
+[package]
+name = "firebase-native-firestore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Cloud Firestore client for firebase-native, over gRPC, with a hand-written public Value model."
+
+# The generated protobuf modules carry the upstream API comments, whose
+# bare code fences rustdoc would otherwise try (and fail) to run as
+# doctests. The crate's own documentation has no doctests.
+[lib]
+doctest = false
+
+[dependencies]
+firebase-native-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = "0.23"
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
