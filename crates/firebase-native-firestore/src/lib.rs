@@ -8,10 +8,11 @@
 //! status the client forces one token refresh and retries the call
 //! exactly once.
 //!
-//! P0 scope is online-only unary operations: get / create / set /
-//! update / delete / list and a basic structured `run_query`. The
-//! Listen and Write streams, the local store and offline persistence
-//! arrive in P1/P2 (see the project work plan).
+//! P0 scope was online-only unary operations: get / create / set /
+//! update / delete / list and a basic structured `run_query`. P1 adds
+//! the Listen stream ([`Firestore::watch_query`] /
+//! [`Firestore::watch_document`]). The Write stream, the local store
+//! and offline persistence arrive in P2 (see the project work plan).
 
 // Generated protobuf modules. Placed at the crate root under `google`
 // because the generated code resolves cross-package references by
@@ -38,12 +39,16 @@ pub mod google {
 }
 
 mod client;
+#[cfg(test)]
+mod golden;
+mod listen;
 mod path;
 mod proxy;
 mod query;
 mod value;
 
 pub use client::{Firestore, ListDocumentsResult};
+pub use listen::{DocumentChange, DocumentChangeKind, Listener, Snapshot};
 pub use path::{collection_path_of, document_id_of, is_collection_path, is_document_path};
 pub use query::{FieldOp, Filter, Order, Query, UnaryOp};
 pub use value::{Document, GeoPoint, Timestamp, Value};

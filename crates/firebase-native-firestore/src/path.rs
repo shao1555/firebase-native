@@ -136,6 +136,41 @@ pub(crate) fn encode_field_path_segment(name: &str) -> String {
     out
 }
 
+/// Splits a Firestore field path into its segments. Segments are
+/// dot-separated; a segment wrapped in backticks may itself contain
+/// dots, and inside backticks a backslash escapes the next character
+/// (for a literal backtick or backslash). This is the inverse of
+/// [`encode_field_path_segment`].
+pub(crate) fn parse_field_path(path: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = path.chars();
+    loop {
+        match chars.next() {
+            None => {
+                segments.push(current);
+                return segments;
+            }
+            Some('`') if !quoted && current.is_empty() => {
+                quoted = true;
+            }
+            Some('`') if quoted => {
+                quoted = false;
+            }
+            Some('\\') if quoted => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            Some('.') if !quoted => {
+                segments.push(std::mem::take(&mut current));
+            }
+            Some(c) => current.push(c),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +185,20 @@ mod tests {
         assert_eq!(encode_field_path_segment("1st"), "`1st`");
         assert_eq!(encode_field_path_segment("a`b"), "`a\\`b`");
         assert_eq!(encode_field_path_segment("a\\b"), "`a\\\\b`");
+    }
+
+    #[test]
+    fn field_path_parsing() {
+        assert_eq!(parse_field_path("title"), vec!["title"]);
+        assert_eq!(parse_field_path("a.b.c"), vec!["a", "b", "c"]);
+        assert_eq!(parse_field_path("`a.b`.c"), vec!["a.b", "c"]);
+        assert_eq!(parse_field_path("`a\\`b`"), vec!["a`b"]);
+        assert_eq!(parse_field_path("`a\\\\b`"), vec!["a\\b"]);
+        // Round trip with the encoder for names that need quoting.
+        for name in ["a.b", "a b", "a`b", "1st"] {
+            let encoded = encode_field_path_segment(name);
+            assert_eq!(parse_field_path(&encoded), vec![name], "{name}");
+        }
     }
 
     #[test]
