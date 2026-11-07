@@ -85,7 +85,10 @@ pub struct Firestore {
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
     endpoint: String,
-    channel: tokio::sync::OnceCell<Channel>,
+    channel: Arc<tokio::sync::OnceCell<Channel>>,
+    /// The persistence engine, when local persistence is enabled
+    /// via [`Firestore::with_local_store`].
+    engine: Option<Arc<crate::engine::PersistenceEngine>>,
 }
 
 impl Firestore {
@@ -96,7 +99,59 @@ impl Firestore {
             options: app.options().clone(),
             tokens,
             endpoint: DEFAULT_ENDPOINT.to_string(),
-            channel: tokio::sync::OnceCell::new(),
+            channel: Arc::new(tokio::sync::OnceCell::new()),
+            engine: None,
+        }
+    }
+
+    /// Enables local persistence on this client, backed by the
+    /// SQLite store at `path`: writes are queued locally and
+    /// committed over the Write stream by a background pump, reads
+    /// are served from the local view (server-confirmed state plus
+    /// queued mutations), and queued writes survive restarts.
+    ///
+    /// The store's location is the caller's choice — the crate
+    /// owns no storage policy. Call this after
+    /// [`Firestore::with_endpoint`] when overriding the endpoint:
+    /// the write path captures the endpoint (and shares the gRPC
+    /// channel) at this point.
+    pub fn enable_local_store(mut self, path: &std::path::Path) -> Result<Self> {
+        let store = Arc::new(crate::store::LocalStore::open(path)?);
+        let write = crate::write::WriteStream::new(
+            self.options.clone(),
+            self.tokens.clone(),
+            self.channel.clone(),
+            self.endpoint.clone(),
+        );
+        self.engine = Some(Arc::new(crate::engine::PersistenceEngine::new(
+            store,
+            write,
+            self.options.documents_prefix(),
+        )));
+        Ok(self)
+    }
+
+    /// Waits until every queued local write has been committed (or
+    /// fails with the error of a batch the server permanently
+    /// rejected). A no-op for clients without local persistence.
+    /// Enqueues one mutation in persistent mode and returns the
+    /// resulting local view of the document.
+    fn enqueue_and_view(
+        &self,
+        engine: &Arc<crate::engine::PersistenceEngine>,
+        mutation: crate::mutation::Mutation,
+        path: &str,
+    ) -> Result<Document> {
+        engine.enqueue(vec![mutation])?;
+        engine
+            .local_document(path)?
+            .ok_or_else(|| Error::Other("local view lost the document after enqueue".to_string()))
+    }
+
+    pub async fn wait_for_pending_writes(&self) -> Result<()> {
+        match &self.engine {
+            Some(engine) => engine.wait_for_pending_writes().await,
+            None => Ok(()),
         }
     }
 
@@ -108,50 +163,11 @@ impl Firestore {
     }
 
     async fn channel(&self) -> Result<Channel> {
-        // The dependency graph enables more than one rustls crypto
-        // provider, so rustls cannot pick one automatically; select
-        // ring as the process default before any TLS config is built
-        // (a no-op when a default was already installed).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        self.channel
-            .get_or_try_init(|| async {
-                let mut endpoint = Endpoint::from_shared(self.endpoint.clone())
-                    .map_err(|err| Error::Other(format!("invalid endpoint: {err}")))?;
-                if self.endpoint.starts_with("https://") {
-                    // Behind a proxy (grpc_proxy / https_proxy / all_proxy
-                    // in the environment), tonic's own transport cannot
-                    // reach the endpoint: tunnel with CONNECT instead.
-                    if let Some(proxy) = endpoint
-                        .uri()
-                        .host()
-                        .and_then(crate::proxy::ProxyConfig::from_env_for)
-                    {
-                        let proxy = std::sync::Arc::new(proxy);
-                        // The connector returns the CONNECT tunnel;
-                        // this TLS config runs over it (and is also
-                        // what makes tonic accept an https URI).
-                        let endpoint = endpoint
-                            .tls_config(ClientTlsConfig::new().with_native_roots())
-                            .map_err(|err| Error::Other(format!("tls config: {err}")))?;
-                        return Ok(endpoint.connect_with_connector_lazy(tower::service_fn(
-                            move |uri: tonic::transport::Uri| {
-                                let proxy = proxy.clone();
-                                async move {
-                                    let host = uri.host().unwrap_or_default().to_string();
-                                    let port = uri.port_u16().unwrap_or(443);
-                                    crate::proxy::connect_via_proxy(proxy, host, port).await
-                                }
-                            },
-                        )));
-                    }
-                    endpoint = endpoint
-                        .tls_config(ClientTlsConfig::new().with_native_roots())
-                        .map_err(|err| Error::Other(format!("tls config: {err}")))?;
-                }
-                Ok(endpoint.connect_lazy())
-            })
-            .await
-            .cloned()
+        let channel = self
+            .channel
+            .get_or_try_init(|| build_channel(&self.endpoint))
+            .await?;
+        Ok(channel.clone())
     }
 
     async fn client(&self, force_refresh: bool) -> Result<FirestoreClient<AuthService>> {
@@ -268,6 +284,47 @@ impl Firestore {
     /// `None` when the document does not exist.
     pub async fn get_document(&self, path: &str) -> Result<Option<Document>> {
         validate_document_path(path)?;
+        if let Some(engine) = &self.engine {
+            // Persistent mode: the local view answers first. When
+            // nothing is known locally, fall back to an online fetch
+            // and cache the result.
+            if let Some(document) = engine.local_document(path)? {
+                return Ok(Some(document));
+            }
+            if engine.has_pending(path)? {
+                // A queued mutation (e.g. a delete) already decides
+                // this document's local state.
+                return Ok(None);
+            }
+            // Capture the local-state generation before the fetch:
+            // any local change while it is in flight — a write
+            // queued, or queued *and already acknowledged* — means
+            // the response describes an older read point than the
+            // current local state.
+            let generation = engine.generation();
+            let document_generation = engine.document_generation(path);
+            let fetched = self.get_document_online(path).await?;
+            if engine.generation() == generation {
+                // Nothing raced the fetch: cache and return as-is.
+                match &fetched {
+                    Some(document) => engine.store_remote_document(document)?,
+                    None => engine.store_remote_absent(path)?,
+                }
+                return Ok(fetched);
+            }
+            // Reconcile conservatively and answer from the current
+            // local view. A missing result evicts nothing (a create
+            // may have been acknowledged after the fetch's read
+            // point); a fetched document goes through the engine's
+            // reconciliation, which also covers the acknowledged-
+            // delete case (no cache row left to compare against).
+            engine.reconcile_fetched_document(path, fetched.as_ref(), document_generation)?;
+            return engine.local_document(path);
+        }
+        self.get_document_online(path).await
+    }
+
+    async fn get_document_online(&self, path: &str) -> Result<Option<Document>> {
         let name = full_document_name(&self.options.documents_prefix(), path);
         let result = self
             .call(move |mut client| {
@@ -301,6 +358,23 @@ impl Firestore {
         fields: Fields,
     ) -> Result<Document> {
         validate_collection_path(collection_path)?;
+        if let Some(engine) = &self.engine {
+            let document_id = document_id
+                .map(str::to_string)
+                .unwrap_or_else(generate_document_id);
+            let path = format!("{collection_path}/{document_id}");
+            validate_document_path(&path)?;
+            return self.enqueue_and_view(
+                engine,
+                crate::mutation::Mutation::Set {
+                    path: path.clone(),
+                    fields,
+                    merge_paths: None,
+                    exists: Some(false),
+                },
+                &path,
+            );
+        }
         let (parent, collection_id) =
             split_collection(&self.options.documents_prefix(), collection_path);
         let proto_document = crate::google::firestore::v1::Document {
@@ -342,6 +416,19 @@ impl Firestore {
             .keys()
             .map(|key| crate::path::encode_field_path_segment(key))
             .collect();
+        if let Some(engine) = &self.engine {
+            validate_document_path(path)?;
+            return self.enqueue_and_view(
+                engine,
+                crate::mutation::Mutation::Set {
+                    path: path.to_string(),
+                    fields,
+                    merge_paths: Some(mask),
+                    exists: None,
+                },
+                path,
+            );
+        }
         self.update_document_with_mask(path, fields, &mask).await
     }
 
@@ -352,6 +439,42 @@ impl Firestore {
         fields: Fields,
         field_mask: &[String],
     ) -> Result<Document> {
+        if let Some(engine) = &self.engine {
+            validate_document_path(path)?;
+            // An update patches an existing document, so it needs a
+            // known base. When the local view has none, establish
+            // the base from the server first: a missing document is
+            // NotFound and an unreachable server is an error — and
+            // in both cases nothing is queued, so an update that is
+            // returned as failed never takes effect later behind
+            // the caller's back. (A queued delete ahead of it also
+            // leaves the view empty; the update then fails the same
+            // way it will on the server.)
+            if engine.local_document(path)?.is_none() {
+                match self.get_document_online(path).await {
+                    Ok(Some(document)) => engine.store_remote_document(&document)?,
+                    Ok(None) => {
+                        return Err(Error::NotFound(format!("no document exists at {path}")));
+                    }
+                    Err(error) => return Err(error),
+                }
+                if engine.local_document(path)?.is_none() {
+                    return Err(Error::NotFound(format!(
+                        "document at {path} is not present in the local view"
+                    )));
+                }
+            }
+            return self.enqueue_and_view(
+                engine,
+                crate::mutation::Mutation::Patch {
+                    path: path.to_string(),
+                    fields,
+                    mask: field_mask.to_vec(),
+                    exists: Some(true),
+                },
+                path,
+            );
+        }
         self.update_document_with_mask(path, fields, field_mask)
             .await
     }
@@ -395,6 +518,12 @@ impl Firestore {
     /// Deletes a document. Deleting a missing document succeeds.
     pub async fn delete_document(&self, path: &str) -> Result<()> {
         validate_document_path(path)?;
+        if let Some(engine) = &self.engine {
+            engine.enqueue(vec![crate::mutation::Mutation::Delete {
+                path: path.to_string(),
+            }])?;
+            return Ok(());
+        }
         let name = full_document_name(&self.options.documents_prefix(), path);
         self.call(move |mut client| {
             let name = name.clone();
@@ -521,6 +650,79 @@ pub(crate) fn map_status(status: Status) -> Error {
 /// Builds an authenticated gRPC client over an existing channel.
 /// Shared by the unary calls and the Listen stream driver: every
 /// (re)connection fetches the token for that attempt.
+/// Builds the shared gRPC channel for an endpoint: native-root TLS
+/// for `https://`, with a CONNECT tunnel when the environment
+/// routes through a proxy (tonic cannot tunnel by itself).
+pub(crate) async fn build_channel(endpoint_str: &str) -> Result<Channel> {
+    // The dependency graph enables more than one rustls crypto
+    // provider, so rustls cannot pick one automatically; select
+    // ring as the process default before any TLS config is built
+    // (a no-op when a default was already installed).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut endpoint = Endpoint::from_shared(endpoint_str.to_string())
+        .map_err(|err| Error::Other(format!("invalid endpoint: {err}")))?;
+    if endpoint_str.starts_with("https://") {
+        if let Some(proxy) = endpoint
+            .uri()
+            .host()
+            .and_then(crate::proxy::ProxyConfig::from_env_for)
+        {
+            let proxy = std::sync::Arc::new(proxy);
+            // The connector returns the CONNECT tunnel; this TLS
+            // config runs over it (and is also what makes tonic
+            // accept an https URI).
+            let endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_native_roots())
+                .map_err(|err| Error::Other(format!("tls config: {err}")))?;
+            return Ok(endpoint.connect_with_connector_lazy(tower::service_fn(
+                move |uri: tonic::transport::Uri| {
+                    let proxy = proxy.clone();
+                    async move {
+                        let host = uri.host().unwrap_or_default().to_string();
+                        let port = uri.port_u16().unwrap_or(443);
+                        crate::proxy::connect_via_proxy(proxy, host, port).await
+                    }
+                },
+            )));
+        }
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|err| Error::Other(format!("tls config: {err}")))?;
+    }
+    Ok(endpoint.connect_lazy())
+}
+
+/// Generates a random-looking 20-character document ID, the same
+/// shape Firestore's own clients generate. Entropy comes from the
+/// system clock, the process id and a process-wide counter mixed
+/// with a splitmix64 finalizer: enough for collision-resistant IDs
+/// without a randomness dependency.
+fn generate_document_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut state = nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ COUNTER
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let mut id = String::with_capacity(20);
+    for _ in 0..20 {
+        // splitmix64 step.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        id.push(ALPHABET[(z % 62) as usize] as char);
+    }
+    id
+}
+
 pub(crate) async fn grpc_client(
     channel: Channel,
     options: &FirebaseOptions,
@@ -546,6 +748,48 @@ pub(crate) async fn grpc_client(
 
 #[cfg(test)]
 mod tests {
+    use crate::value::Value;
+    use firebase_native_core::{App, FirebaseOptions};
+
+    struct StubTokens;
+
+    #[async_trait::async_trait]
+    impl firebase_native_core::TokenProvider for StubTokens {
+        async fn id_token(&self, _force_refresh: bool) -> Result<String> {
+            Ok("stub-token".to_string())
+        }
+    }
+
+    /// An update against a document with no known local base, while
+    /// the server is unreachable, must fail *without* queueing: a
+    /// failed operation may not take effect later.
+    #[tokio::test]
+    async fn persistent_update_without_base_fails_without_queueing() {
+        let dir = std::env::temp_dir().join(format!(
+            "firebase-native-client-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+
+        let options = FirebaseOptions::new("test-key", "test-project").with_database_id("testdb");
+        let app = App::new(options);
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint("http://127.0.0.1:9")
+            .enable_local_store(&store_path)
+            .unwrap();
+        let mut fields = Fields::new();
+        fields.insert("n".to_string(), Value::Integer(1));
+        let result = firestore
+            .update_document("notes/a", fields, &["n".to_string()])
+            .await;
+        assert!(result.is_err(), "update should fail: {result:?}");
+        let store = crate::store::LocalStore::open(&store_path).unwrap();
+        assert_eq!(store.batch_count().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

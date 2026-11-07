@@ -464,22 +464,22 @@ fn is_terminal(code: Code) -> bool {
 /// Exponential backoff for stream re-establishment: 1s doubling to a
 /// 30s cap, with up-to-half jitter. Reset after a snapshot is
 /// delivered, i.e. the stream proved healthy.
-struct Backoff {
+pub(crate) struct Backoff {
     current: Duration,
 }
 
 impl Backoff {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             current: Duration::from_secs(1),
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.current = Duration::from_secs(1);
     }
 
-    fn next_delay(&mut self) -> Duration {
+    pub(crate) fn next_delay(&mut self) -> Duration {
         let base = self.current;
         self.current = (self.current * 2).min(Duration::from_secs(30));
         // Jitter from the wall clock's sub-second part; the exact
@@ -631,7 +631,7 @@ async fn run_watch(
 /// Whether acquiring a token failed transiently (transport or
 /// retryable service errors) as opposed to permanently (no session,
 /// rejected credentials, configuration errors).
-fn is_transient_token_error(error: &Error) -> bool {
+pub(crate) fn is_transient_token_error(error: &Error) -> bool {
     match error {
         Error::Http(_) => true,
         // REST failures from the Auth token endpoints: throttling

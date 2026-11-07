@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use firebase_native_core::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::google::firestore::v1::{value::ValueType, MapValue};
 use crate::Fields;
@@ -12,7 +13,7 @@ use crate::Fields;
 type ProtoValue = crate::google::firestore::v1::Value;
 
 /// A Firestore timestamp: seconds and nanoseconds since the Unix epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Timestamp {
     /// Seconds since the Unix epoch.
     pub seconds: i64,
@@ -89,17 +90,64 @@ impl From<prost_types::Timestamp> for Timestamp {
 }
 
 /// A geographic point (latitude / longitude in degrees).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Lossless serde encoding for `f64` fields: JSON (the mutation
+/// queue's encoding) has no representation for NaN or the
+/// infinities — serde_json silently emits `null` for them and the
+/// value cannot be read back. Finite values encode as plain JSON
+/// numbers; non-finite values encode as the strings "NaN",
+/// "Infinity" and "-Infinity". Firestore fully supports all three
+/// as double values, so losing them would corrupt queued writes.
+pub(crate) mod lossless_f64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serializes an `f64` losslessly.
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_nan() {
+            serializer.serialize_str("NaN")
+        } else if *value == f64::INFINITY {
+            serializer.serialize_str("Infinity")
+        } else if *value == f64::NEG_INFINITY {
+            serializer.serialize_str("-Infinity")
+        } else {
+            serializer.serialize_f64(*value)
+        }
+    }
+
+    /// Deserializes an `f64` written by the matching serializer.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(f64),
+            Text(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Number(value) => Ok(value),
+            Repr::Text(text) => match text.as_str() {
+                "NaN" => Ok(f64::NAN),
+                "Infinity" => Ok(f64::INFINITY),
+                "-Infinity" => Ok(f64::NEG_INFINITY),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid non-finite double encoding: {other}"
+                ))),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GeoPoint {
     /// Latitude in degrees.
+    #[serde(with = "lossless_f64")]
     pub latitude: f64,
     /// Longitude in degrees.
+    #[serde(with = "lossless_f64")]
     pub longitude: f64,
 }
 
 /// A Firestore value. Mirrors the `Value` oneof of the Firestore API
 /// without exposing the generated protobuf type.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     /// `NULL`.
     Null,
@@ -108,7 +156,7 @@ pub enum Value {
     /// A 64-bit integer.
     Integer(i64),
     /// A 64-bit floating point number.
-    Double(f64),
+    Double(#[serde(with = "lossless_f64")] f64),
     /// A UTF-8 string.
     String(String),
     /// Raw bytes.

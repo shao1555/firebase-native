@@ -11,8 +11,13 @@
 //! P0 scope was online-only unary operations: get / create / set /
 //! update / delete / list and a basic structured `run_query`. P1 adds
 //! the Listen stream ([`Firestore::watch_query`] /
-//! [`Firestore::watch_document`]). The Write stream, the local store
-//! and offline persistence arrive in P2 (see the project work plan).
+//! [`Firestore::watch_document`]). P2 (part 1) adds offline
+//! persistence: with [`Firestore::enable_local_store`] writes are
+//! queued in a local SQLite store, reflected in reads immediately,
+//! and committed in the background over the Write stream, surviving
+//! restarts. Listen results do not flow through the store yet, and
+//! queries still run online in persistent mode; the Write/Listen
+//! spec-test suites land in P2 (part 2).
 
 // Generated protobuf modules. Placed at the crate root under `google`
 // because the generated code resolves cross-package references by
@@ -39,13 +44,17 @@ pub mod google {
 }
 
 mod client;
+mod engine;
 #[cfg(test)]
 mod golden;
 mod listen;
+mod mutation;
 mod path;
 mod proxy;
 mod query;
+mod store;
 mod value;
+mod write;
 
 pub use client::{Firestore, ListDocumentsResult};
 pub use listen::{DocumentChange, DocumentChangeKind, Listener, Snapshot};
