@@ -194,6 +194,147 @@ impl Value {
     }
 }
 
+impl Value {
+    /// Compares two values using Firestore's total ordering, the one
+    /// the server applies for `orderBy` and range filters:
+    ///
+    /// `Null < Bool < Number < Timestamp < String < Bytes <
+    /// Reference < GeoPoint < Array < Map`, with numbers compared
+    /// numerically across integers and doubles (`NaN` before all
+    /// other numbers). Used to sort watch snapshots locally exactly
+    /// as the server would.
+    pub fn compare(&self, other: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        let rank = |value: &Value| match value {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Integer(_) | Value::Double(_) => 2,
+            Value::Timestamp(_) => 3,
+            Value::String(_) => 4,
+            Value::Bytes(_) => 5,
+            Value::Reference(_) => 6,
+            Value::GeoPoint(_) => 7,
+            Value::Array(_) => 8,
+            Value::Map(_) => 9,
+        };
+        match rank(self).cmp(&rank(other)) {
+            Equal => {}
+            ordering => return ordering,
+        }
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Double(a), Value::Double(b)) => compare_doubles(*a, *b),
+            (Value::Integer(a), Value::Double(b)) => compare_int_double(*a, *b),
+            (Value::Double(a), Value::Integer(b)) => compare_int_double(*b, *a).reverse(),
+            (Value::Timestamp(a), Value::Timestamp(b)) => {
+                a.seconds.cmp(&b.seconds).then(a.nanos.cmp(&b.nanos))
+            }
+            (Value::String(a), Value::String(b)) => a.cmp(b),
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            (Value::Reference(a), Value::Reference(b)) => compare_references(a, b),
+            (Value::GeoPoint(a), Value::GeoPoint(b)) => a
+                .latitude
+                .total_cmp(&b.latitude)
+                .then(a.longitude.total_cmp(&b.longitude)),
+            (Value::Array(a), Value::Array(b)) => {
+                for (left, right) in a.iter().zip(b.iter()) {
+                    match left.compare(right) {
+                        Equal => continue,
+                        ordering => return ordering,
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Value::Map(a), Value::Map(b)) => {
+                // Maps compare as their (key, value) pair sequence in
+                // key order: first differing key decides, then the
+                // value under the shared key, then length.
+                let mut left = a.iter();
+                let mut right = b.iter();
+                loop {
+                    match (left.next(), right.next()) {
+                        (None, None) => return Equal,
+                        (None, Some(_)) => return Less,
+                        (Some(_), None) => return Greater,
+                        (Some((lk, lv)), Some((rk, rv))) => match lk.cmp(rk) {
+                            Equal => match lv.compare(rv) {
+                                Equal => continue,
+                                ordering => return ordering,
+                            },
+                            ordering => return ordering,
+                        },
+                    }
+                }
+            }
+            _ => Equal,
+        }
+    }
+}
+
+/// Orders doubles with `NaN` before every other number (Firestore
+/// semantics), otherwise by value.
+fn compare_doubles(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Equal,
+        (true, false) => Less,
+        (false, true) => Greater,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Equal),
+    }
+}
+
+/// Compares an integer with a double numerically. When the double is
+/// integral and in `i64` range the comparison is exact; otherwise the
+/// double's fractional part (or its magnitude beyond `i64`) decides.
+fn compare_int_double(int: i64, double: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    if double.is_nan() {
+        return Greater; // NaN sorts before all numbers.
+    }
+    if double >= 9_223_372_036_854_775_808.0 {
+        return Less; // 2^63: beyond every i64.
+    }
+    if double < -9_223_372_036_854_775_808.0 {
+        return Greater;
+    }
+    let truncated = double.trunc();
+    let as_int = truncated as i64;
+    match int.cmp(&as_int) {
+        Equal => {
+            // Same integral part: a positive fraction makes the
+            // double larger, a negative fraction smaller.
+            let fraction = double - truncated;
+            if fraction > 0.0 {
+                Less
+            } else if fraction < 0.0 {
+                Greater
+            } else {
+                Equal
+            }
+        }
+        ordering => ordering,
+    }
+}
+
+/// References order by path segment, not by raw string: segments
+/// compare individually and a strict prefix sorts first.
+fn compare_references(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut left = a.split('/');
+    let mut right = b.split('/');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(l), Some(r)) => match l.cmp(r) {
+                std::cmp::Ordering::Equal => continue,
+                ordering => return ordering,
+            },
+        }
+    }
+}
+
 impl From<bool> for Value {
     fn from(v: bool) -> Self {
         Value::Bool(v)
@@ -363,5 +504,82 @@ mod tests {
         assert_eq!(ts.seconds, 1_700_000_000);
         assert_eq!(ts.nanos, 42_000_000);
         assert_eq!(ts.to_system_time(), time);
+    }
+
+    #[test]
+    fn ordering_across_types() {
+        use std::cmp::Ordering::*;
+        let ordered: Vec<Value> = vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Double(f64::NAN),
+            Value::Integer(-1),
+            Value::Double(-0.5),
+            Value::Integer(0),
+            Value::Double(0.5),
+            Value::Integer(2),
+            Value::Timestamp(Timestamp::new(0, 0)),
+            Value::String("a".to_string()),
+            Value::Bytes(vec![0]),
+            Value::Reference("projects/p/databases/d/documents/a/b".to_string()),
+            Value::GeoPoint(GeoPoint {
+                latitude: 0.0,
+                longitude: 0.0,
+            }),
+            Value::Array(vec![Value::Integer(1)]),
+            Value::Map(Fields::new()),
+        ];
+        for pair in ordered.windows(2) {
+            assert_eq!(pair[0].compare(&pair[1]), Less, "{pair:?}");
+            assert_eq!(pair[1].compare(&pair[0]), Greater, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn ordering_numbers_mixed() {
+        use std::cmp::Ordering::*;
+        // Integral doubles equal the integer.
+        assert_eq!(Value::Integer(2).compare(&Value::Double(2.0)), Equal);
+        assert_eq!(Value::Integer(2).compare(&Value::Double(2.5)), Less);
+        assert_eq!(Value::Integer(-2).compare(&Value::Double(-2.5)), Greater);
+        assert_eq!(Value::Double(-2.5).compare(&Value::Integer(-2)), Less);
+        // Beyond-i64 doubles.
+        assert_eq!(
+            Value::Integer(i64::MAX).compare(&Value::Double(9.223372036854776e18)),
+            Less
+        );
+        // NaN before -inf, -0.0 equals 0.
+        assert_eq!(
+            Value::Double(f64::NAN).compare(&Value::Double(f64::NEG_INFINITY)),
+            Less
+        );
+        assert_eq!(Value::Double(-0.0).compare(&Value::Integer(0)), Equal);
+    }
+
+    #[test]
+    fn ordering_composites() {
+        use std::cmp::Ordering::*;
+        let a1 = Value::Array(vec![Value::Integer(1), Value::Integer(9)]);
+        let a2 = Value::Array(vec![Value::Integer(1)]);
+        assert_eq!(a1.compare(&a2), Greater);
+        let mut m1 = Fields::new();
+        m1.insert("a".to_string(), Value::Integer(1));
+        let mut m2 = Fields::new();
+        m2.insert("a".to_string(), Value::Integer(2));
+        let mut m3 = Fields::new();
+        m3.insert("b".to_string(), Value::Integer(0));
+        assert_eq!(Value::Map(m1.clone()).compare(&Value::Map(m2)), Less);
+        assert_eq!(Value::Map(m1).compare(&Value::Map(m3)), Less);
+        // References compare segment-wise: "a/b" < "a/b/c" and segment
+        // boundaries matter ("a2" is one segment).
+        assert_eq!(
+            Value::Reference("x/a/b".to_string()).compare(&Value::Reference("x/a/b/c".to_string())),
+            Less
+        );
+        assert_eq!(
+            Value::Reference("x/a2".to_string()).compare(&Value::Reference("x/a/b".to_string())),
+            Greater
+        );
     }
 }

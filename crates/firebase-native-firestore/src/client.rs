@@ -20,10 +20,10 @@ use crate::Fields;
 
 const DEFAULT_ENDPOINT: &str = "https://firestore.googleapis.com";
 
-type AuthService = InterceptedService<Channel, AuthInterceptor>;
+pub(crate) type AuthService = InterceptedService<Channel, AuthInterceptor>;
 
 #[derive(Clone)]
-struct AuthInterceptor {
+pub(crate) struct AuthInterceptor {
     header_value: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     request_params: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
 }
@@ -155,21 +155,13 @@ impl Firestore {
     }
 
     async fn client(&self, force_refresh: bool) -> Result<FirestoreClient<AuthService>> {
-        let token = self.tokens.id_token(force_refresh).await?;
-        let header_value = format!("Bearer {token}")
-            .parse()
-            .map_err(|_| Error::Other("ID token is not a valid header value".to_string()))?;
-        let request_params = routing_header(&self.options.project_id, &self.options.database_id)
-            .parse()
-            .map_err(|_| Error::Other("routing header is not a valid header value".to_string()))?;
-        let service = InterceptedService::new(
+        grpc_client(
             self.channel().await?,
-            AuthInterceptor {
-                header_value,
-                request_params,
-            },
-        );
-        Ok(FirestoreClient::new(service))
+            &self.options,
+            &self.tokens,
+            force_refresh,
+        )
+        .await
     }
 
     /// Runs `op` with an authenticated client. On `UNAUTHENTICATED`,
@@ -190,6 +182,84 @@ impl Firestore {
                 Err(status) => return Err(map_status(status)),
             }
         }
+    }
+
+    // -- Listen (P1) ------------------------------------------------------
+
+    /// Watches a collection query: opens a Listen stream and returns
+    /// a [`Listener`] yielding a snapshot at `CURRENT` and at every
+    /// later consistent point where the view changed. `parent_path`
+    /// follows the same convention as [`Firestore::run_query`].
+    ///
+    /// The stream reconnects with the last resume token and
+    /// exponential backoff when it breaks; terminal failures
+    /// (permission denied, invalid target, ...) are delivered as one
+    /// final `Err` item.
+    pub async fn watch_query(
+        &self,
+        parent_path: &str,
+        query: Query,
+    ) -> Result<crate::listen::Listener> {
+        let parent = if parent_path.is_empty() {
+            self.options.documents_prefix()
+        } else {
+            validate_document_path(parent_path)?;
+            full_document_name(&self.options.documents_prefix(), parent_path)
+        };
+        let orders = query.effective_orders();
+        let target = crate::google::firestore::v1::Target {
+            target_id: crate::listen::TARGET_ID,
+            once: false,
+            expected_count: None,
+            target_type: Some(
+                crate::google::firestore::v1::target::TargetType::Query(
+                    crate::google::firestore::v1::target::QueryTarget {
+                        parent,
+                        query_type: Some(
+                            crate::google::firestore::v1::target::query_target::QueryType::StructuredQuery(
+                                query.to_proto(),
+                            ),
+                        ),
+                    },
+                ),
+            ),
+            resume_type: None,
+        };
+        let channel = self.channel().await?;
+        Ok(crate::listen::spawn_watch(
+            channel,
+            self.options.clone(),
+            self.tokens.clone(),
+            target,
+            orders,
+        ))
+    }
+
+    /// Watches a single document by relative path. The snapshot
+    /// holds the document when it exists and is empty when it does
+    /// not (or stops existing).
+    pub async fn watch_document(&self, path: &str) -> Result<crate::listen::Listener> {
+        validate_document_path(path)?;
+        let name = full_document_name(&self.options.documents_prefix(), path);
+        let target = crate::google::firestore::v1::Target {
+            target_id: crate::listen::TARGET_ID,
+            once: false,
+            expected_count: None,
+            target_type: Some(crate::google::firestore::v1::target::TargetType::Documents(
+                crate::google::firestore::v1::target::DocumentsTarget {
+                    documents: vec![name],
+                },
+            )),
+            resume_type: None,
+        };
+        let channel = self.channel().await?;
+        Ok(crate::listen::spawn_watch(
+            channel,
+            self.options.clone(),
+            self.tokens.clone(),
+            target,
+            Vec::new(),
+        ))
     }
 
     // -- Unary CRUD -------------------------------------------------------
@@ -434,7 +504,7 @@ impl Firestore {
 }
 
 /// Maps a gRPC status onto the shared error type.
-fn map_status(status: Status) -> Error {
+pub(crate) fn map_status(status: Status) -> Error {
     let message = status.message().to_string();
     match status.code() {
         Code::Unauthenticated => Error::Unauthenticated(message),
@@ -446,6 +516,32 @@ fn map_status(status: Status) -> Error {
             message,
         },
     }
+}
+
+/// Builds an authenticated gRPC client over an existing channel.
+/// Shared by the unary calls and the Listen stream driver: every
+/// (re)connection fetches the token for that attempt.
+pub(crate) async fn grpc_client(
+    channel: Channel,
+    options: &FirebaseOptions,
+    tokens: &Arc<dyn TokenProvider>,
+    force_refresh: bool,
+) -> Result<FirestoreClient<AuthService>> {
+    let token = tokens.id_token(force_refresh).await?;
+    let header_value = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| Error::Other("ID token is not a valid header value".to_string()))?;
+    let request_params = routing_header(&options.project_id, &options.database_id)
+        .parse()
+        .map_err(|_| Error::Other("routing header is not a valid header value".to_string()))?;
+    let service = InterceptedService::new(
+        channel,
+        AuthInterceptor {
+            header_value,
+            request_params,
+        },
+    );
+    Ok(FirestoreClient::new(service))
 }
 
 #[cfg(test)]

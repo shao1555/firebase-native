@@ -229,6 +229,56 @@ impl Query {
         self
     }
 
+    /// The effective ordering the server applies, following the
+    /// Standard-edition rules in the `StructuredQuery` documentation:
+    /// every field used with an inequality filter must be ordered;
+    /// missing ones are appended in lexicographical field order with
+    /// the direction of the last specified order (ascending when
+    /// there is none). `__name__` is not listed here; it is the
+    /// implicit final tiebreak applied by the snapshot sorter.
+    pub(crate) fn effective_orders(&self) -> Vec<Order> {
+        let mut orders = self.orders.clone();
+        let mut missing: Vec<&str> = Vec::new();
+        for filter in &self.filters {
+            // Inequality filters: field comparisons other than
+            // equality/containment, plus the unary IS_NOT_NULL /
+            // IS_NOT_NAN tests (the proto documentation explicitly
+            // requires those fields first in the ordering too).
+            let inequality_field = match filter {
+                Filter::Field { field, op, .. } => match op {
+                    FieldOp::LessThan
+                    | FieldOp::LessThanOrEqual
+                    | FieldOp::GreaterThan
+                    | FieldOp::GreaterThanOrEqual
+                    | FieldOp::NotEqual
+                    | FieldOp::NotIn => Some(field.as_str()),
+                    _ => None,
+                },
+                Filter::Unary { field, op } => match op {
+                    UnaryOp::IsNotNull | UnaryOp::IsNotNan => Some(field.as_str()),
+                    _ => None,
+                },
+            };
+            if let Some(field) = inequality_field {
+                if field != "__name__"
+                    && !orders.iter().any(|order| order.field == field)
+                    && !missing.contains(&field)
+                {
+                    missing.push(field);
+                }
+            }
+        }
+        missing.sort_unstable();
+        let descending = orders.last().is_some_and(|order| order.descending);
+        for field in missing {
+            orders.push(Order {
+                field: field.to_string(),
+                descending,
+            });
+        }
+        orders
+    }
+
     pub(crate) fn to_proto(&self) -> StructuredQuery {
         let filter = match self.filters.len() {
             0 => None,
@@ -301,6 +351,68 @@ mod tests {
                 composite,
             ) => assert_eq!(composite.filters.len(), 2),
             other => panic!("unexpected filter type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_orders_append_inequality_fields() {
+        // WHERE rank > 0 with no explicit order: implicit rank ASC.
+        let query = Query::new("notes").filter(Filter::Field {
+            field: "rank".to_string(),
+            op: FieldOp::GreaterThan,
+            value: Value::Integer(0),
+        });
+        let orders = query.effective_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].field, "rank");
+        assert!(!orders[0].descending);
+
+        // An explicit ordering on another field inherits its
+        // direction for the appended inequality field.
+        let query = Query::new("notes")
+            .filter(Filter::Field {
+                field: "rank".to_string(),
+                op: FieldOp::GreaterThan,
+                value: Value::Integer(0),
+            })
+            .order_by(Order::desc("updatedAt"));
+        let orders = query.effective_orders();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[1].field, "rank");
+        assert!(orders[1].descending);
+
+        // Already ordered by the inequality field: unchanged. An
+        // equality filter adds nothing.
+        let query = Query::new("notes")
+            .filter(Filter::eq("spaceId", Value::String("x".to_string())))
+            .filter(Filter::Field {
+                field: "rank".to_string(),
+                op: FieldOp::LessThan,
+                value: Value::Integer(5),
+            })
+            .order_by(Order::asc("rank"));
+        assert_eq!(query.effective_orders().len(), 1);
+    }
+
+    #[test]
+    fn effective_orders_include_unary_inequalities() {
+        for op in [UnaryOp::IsNotNull, UnaryOp::IsNotNan] {
+            let query = Query::new("notes").filter(Filter::Unary {
+                field: "rank".to_string(),
+                op,
+            });
+            let orders = query.effective_orders();
+            assert_eq!(orders.len(), 1, "{op:?}");
+            assert_eq!(orders[0].field, "rank");
+            assert!(!orders[0].descending);
+        }
+        // The equality-like unary tests add no ordering.
+        for op in [UnaryOp::IsNull, UnaryOp::IsNan] {
+            let query = Query::new("notes").filter(Filter::Unary {
+                field: "rank".to_string(),
+                op,
+            });
+            assert!(query.effective_orders().is_empty(), "{op:?}");
         }
     }
 
