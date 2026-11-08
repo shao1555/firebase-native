@@ -35,19 +35,20 @@ layers, so the runner covers the **watch layer** today:
   query's path and filters (`Query::matches`), and synthesized
   deletes for documents a freshly added target never
   re-confirms (`WatchState::seed_view`).
-- Snapshot metadata owned by layers above the watch state
-  (`fromCache`, `hasPendingWrites`) is **not** compared yet.
 - Cases needing machinery that does not exist yet are reported
-  as **skipped with a reason**, never silently passed: local
-  mutations and write acknowledgements (the write suite's
-  harness), multiple clients/tabs, multiple concurrent targets,
-  query limits, existence filters, snapshots-in-sync listeners,
-  and restart/shutdown/primary-election behavior.
+  as **skipped with a reason**, never silently passed: multiple
+  clients/tabs, multiple concurrent targets, query limits,
+  bloom existence filters and mismatch limbo resolution,
+  snapshots-in-sync listeners, field transforms, and
+  restart/shutdown/primary-election behavior.
 
-Current results: **listen** (66 cases) 20 passed / 46 skipped /
+Current results: **listen** (66 cases) 26 passed / 40 skipped /
 0 failed — skips are multi-client / multi-tab scenarios (28),
-local mutations (7), snapshots-in-sync listeners (4), restart
-(3), multiple concurrent targets (3), query limit (1).
+snapshots-in-sync listeners (4), restart (3), multiple
+concurrent targets (3), limbo existence filters (2), query
+limit (1). **Write** (59 cases) 38 passed / 21 skipped /
+0 failed — skips are multi-client scenarios (15),
+restart/shutdown (4) and field transforms (2).
 **Resume token** (2 cases) 2 passed / 0 skipped. **Existence
 filter** (26 cases) 2 passed / 24 skipped / 0 failed: the
 matching-count cases pass through `WatchState`'s filter
@@ -75,6 +76,39 @@ fault injection: making `WatchState` discard received tokens
 fails both resume-token cases, and making it restart on every
 filter fails both matching-count cases (skips unchanged).
 
-Driving the write suite against the persistence engine and
-store-backed watches (which is where a limbo layer would live)
-are follow-up work, as is comparing snapshot metadata.
+## The write-mode harness
+
+Cases with user writes run in "write mode": the harness drives
+the real `PersistenceEngine` on an in-memory store. Streamed
+watch documents are buffered and applied to the store at the
+next accepted consistent point — never through a local
+operation interleaved before the barrier — so a confirmation
+whose fields are unchanged (which raises no watch snapshot)
+still lands, and a barrier's read time confirms committed
+writes at or below it. User writes become real
+mutation batches in the store's queue, `writeAck` folds the
+oldest batch through the engine's acknowledgement path, and
+`failWrite` drops it (retryable error codes keep it queued, as
+the write stream would retry). Listener events are *composed*
+from the store — remote base overlaid with queued mutations,
+resolved through `PersistenceEngine::local_document` — and
+compared in full: document sets, field values, change
+categorization, `fromCache` / `hasPendingWrites`, per-document
+metadata-only changes, drained `userCallbacks`,
+`numOutstandingWrites` (the spec model's write stream
+pipelines at most 10 batches in flight), and
+`waitForPendingWrites` resolutions.
+
+The semantics this pins down include: `hasPendingWrites`
+counts documents in the view with unacknowledged *or*
+acknowledged-but-watch-unconfirmed writes; an acknowledgement
+raises an event only when the watch had already delivered the
+write's effect (otherwise the flip surfaces, absorbed, with a
+later event); a watch delivery must not resurrect a document
+whose acknowledged delete/patch folded it away at a newer
+version; and the engine's fold must not regress a base the
+watch has already advanced past the commit (a bug the suite
+caught in `PersistenceEngine::fold_acknowledgement`, fixed
+with a regression test). Deliberately not compared: the
+per-document `options`/`version` fields inside metadata
+entries (keys are compared).
