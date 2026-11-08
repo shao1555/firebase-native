@@ -43,6 +43,7 @@ pub mod google {
     }
 }
 
+mod bloom;
 mod client;
 mod engine;
 #[cfg(test)]

@@ -101,15 +101,21 @@ impl Drop for Listener {
 pub(crate) enum WatchEvent {
     /// A new consistent snapshot to deliver.
     Snapshot(Snapshot),
-    /// Restart the stream and re-add the target from scratch (no
-    /// resume token). Produced on an existence-filter mismatch: the
-    /// target is still active on this stream, and the protocol
-    /// forbids adding an active target ID again, so recovery goes
-    /// through a fresh stream rather than a second AddTarget.
-    Restart,
     /// The server removed the target: the watch is over. Carries the
     /// error when the removal had a cause.
     Removed(Option<Error>),
+}
+
+/// The decided outcome of an existence filter, applied at
+/// the next consistent point after its receipt.
+enum FilterOutcome {
+    /// The server's count does not match the view as of
+    /// receipt: the target restarts.
+    Mismatch,
+    /// The count matches; with a bloom filter, these view
+    /// documents fail the bloom check and are definitely gone
+    /// from the server's set.
+    Match { failing: Vec<String> },
 }
 
 /// The Listen protocol state machine for one target.
@@ -132,6 +138,35 @@ pub(crate) struct WatchState {
     /// the first consistent point: the reference client's
     /// synthesized deletes. Empty unless seeded with synthesis.
     unconfirmed: std::collections::BTreeSet<String>,
+    /// Documents that were in the view when an existence-filter
+    /// mismatch restarted the target. Like `unconfirmed` they
+    /// must be re-confirmed by the re-run; at the first
+    /// consistent point they are either deleted (the default) or,
+    /// when `keep_restart_unconfirmed` is set, reported as limbo
+    /// candidates while staying in the view.
+    restart_unconfirmed: std::collections::BTreeSet<String>,
+    /// Limbo candidates produced at a consistent point when
+    /// `keep_restart_unconfirmed` is set; drained by the caller.
+    limbo_candidates: std::collections::BTreeSet<String>,
+    keep_restart_unconfirmed: bool,
+    /// The target was current when the last restart reset it:
+    /// with the delete policy (not keeping restart-unconfirmed
+    /// documents), the synthesized deletes are already due at
+    /// the next consistent point, CURRENT or not.
+    restart_was_current: bool,
+    /// An existence filter received since the last consistent
+    /// point. Filters are applied at consistent points, not on
+    /// receipt: the count is checked against the view as of
+    /// the snapshot (the reference client's "handled at global
+    /// snapshot").
+    pending_filter: Option<FilterOutcome>,
+    /// A deferred filter mismatched at a consistent point and
+    /// restarted the target; drained by the caller (the driver
+    /// re-adds the target; the spec harness masks the token).
+    filter_restart: bool,
+    /// A held existence filter was applied at a consistent
+    /// point (either outcome); drained by the caller.
+    filter_applied: bool,
     /// The highest consistent-point read time accepted so far,
     /// whether or not it produced a snapshot: consistent points
     /// behind it belong to a reverted stream.
@@ -150,6 +185,13 @@ impl WatchState {
             current_received: false,
             resume_token: None,
             unconfirmed: std::collections::BTreeSet::new(),
+            restart_unconfirmed: std::collections::BTreeSet::new(),
+            limbo_candidates: std::collections::BTreeSet::new(),
+            keep_restart_unconfirmed: false,
+            restart_was_current: false,
+            pending_filter: None,
+            filter_restart: false,
+            filter_applied: false,
             highest_consistent_read_time: None,
         }
     }
@@ -185,6 +227,64 @@ impl WatchState {
     /// same for full responses. Used by the spec-test harness
     /// for targeted snapshots it does not feed.
     #[allow(dead_code)]
+    /// Sets whether documents left unconfirmed by an
+    /// existence-filter restart are reported as limbo
+    /// candidates (true) or deleted at the first consistent
+    /// point (false, the default).
+    pub(crate) fn set_keep_restart_unconfirmed(&mut self, keep: bool) {
+        self.keep_restart_unconfirmed = keep;
+    }
+
+    /// Drains the limbo candidates produced at the last
+    /// consistent point (full resource names).
+    // Exercised by the spec-test harness (and staged for
+    // store-backed watches in the driver).
+    #[allow(dead_code)]
+    pub(crate) fn take_limbo_candidates(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.limbo_candidates)
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether the target has been marked CURRENT since its
+    /// (re)add.
+    // Exercised by the spec-test harness (and staged for
+    // store-backed watches in the driver).
+    #[allow(dead_code)]
+    pub(crate) fn is_current(&self) -> bool {
+        self.current_received
+    }
+
+    /// Seeds the view for a re-run re-add: the seeded
+    /// documents must be re-confirmed by the re-run and are
+    /// accounted for at its first consistent point (see
+    /// `restart_unconfirmed`).
+    // Exercised by the spec-test harness (and staged for
+    // store-backed watches in the driver).
+    #[allow(dead_code)]
+    pub(crate) fn seed_restart_unconfirmed(&mut self, documents: Vec<Document>) {
+        for document in &documents {
+            self.restart_unconfirmed.insert(document.name.clone());
+        }
+        self.seed_view(documents, false);
+    }
+
+    /// Marks already-seeded documents as restart-unconfirmed
+    /// (see `restart_unconfirmed`), e.g. limbo documents of a
+    /// session restored after a termination.
+    // Exercised by the spec-test harness (and staged for
+    // store-backed watches in the driver).
+    #[allow(dead_code)]
+    pub(crate) fn mark_restart_unconfirmed(&mut self, names: &[String]) {
+        for name in names {
+            if self.docs.contains_key(name) {
+                self.restart_unconfirmed.insert(name.clone());
+            }
+        }
+    }
+
+    // Exercised by the spec-test harness.
+    #[allow(dead_code)]
     pub(crate) fn note_resume_token(&mut self, token: &[u8]) {
         if !token.is_empty() {
             self.resume_token = Some(token.to_vec());
@@ -216,6 +316,7 @@ impl WatchState {
                     // Any word about this document confirms its
                     // state; it needs no synthesized delete.
                     self.unconfirmed.remove(&document.name);
+                    self.restart_unconfirmed.remove(&document.name);
                 }
                 if change.removed_target_ids.contains(&self.target_id) {
                     self.pending.insert(document.name.clone(), None);
@@ -237,6 +338,7 @@ impl WatchState {
             ResponseType::DocumentDelete(delete) => {
                 if self.applies_to_me(&delete.removed_target_ids) {
                     self.unconfirmed.remove(&delete.document);
+                    self.restart_unconfirmed.remove(&delete.document);
                     self.pending.insert(delete.document, None);
                 }
                 None
@@ -244,6 +346,7 @@ impl WatchState {
             ResponseType::DocumentRemove(remove) => {
                 if self.applies_to_me(&remove.removed_target_ids) {
                     self.unconfirmed.remove(&remove.document);
+                    self.restart_unconfirmed.remove(&remove.document);
                     self.pending.insert(remove.document, None);
                 }
                 None
@@ -252,13 +355,49 @@ impl WatchState {
                 if filter.target_id != self.target_id {
                     return None;
                 }
-                // Existence filter: the server's count must match our
-                // view (pending changes applied). A mismatch means we
-                // missed removals while resuming; discard the view
-                // and re-add without the resume token, like a RESET.
-                if filter.count as usize != self.view_len() {
-                    self.reset_view();
-                    return Some(WatchEvent::Restart);
+                // A filter for a target that has not reached a
+                // consistent point yet is ignored: the target
+                // is still (re)running, so there is no resumed
+                // state for the filter to validate. Otherwise
+                // the filter is decided now, against the view
+                // as of receipt, and its effect lands at the
+                // next consistent point (see
+                // `apply_pending_filter`).
+                if !self.current_received {
+                    return None;
+                }
+                let bloom = filter.unchanged_names.as_ref().and_then(|filter| {
+                    let bits = filter.bits.as_ref()?;
+                    crate::bloom::BloomFilter::new(
+                        bits.bitmap.clone(),
+                        bits.padding,
+                        filter.hash_count,
+                    )
+                });
+                if filter.count as usize != self.view_len(&bloom) {
+                    self.pending_filter = Some(FilterOutcome::Mismatch);
+                } else if let Some(bloom) = bloom {
+                    let mut names: std::collections::BTreeSet<String> =
+                        self.docs.keys().cloned().collect();
+                    for (name, change) in &self.pending {
+                        match change {
+                            Some(_) => {
+                                names.insert(name.clone());
+                            }
+                            None => {
+                                names.remove(name);
+                            }
+                        }
+                    }
+                    let failing = names
+                        .into_iter()
+                        .filter(|name| !bloom.contains(name))
+                        .collect();
+                    self.pending_filter = Some(FilterOutcome::Match { failing });
+                } else {
+                    self.pending_filter = Some(FilterOutcome::Match {
+                        failing: Vec::new(),
+                    });
                 }
                 None
             }
@@ -266,7 +405,7 @@ impl WatchState {
         }
     }
 
-    fn view_len(&self) -> usize {
+    fn view_len(&self, bloom: &Option<crate::bloom::BloomFilter>) -> usize {
         let mut names: std::collections::BTreeSet<&String> = self.docs.keys().collect();
         for (name, change) in &self.pending {
             match change {
@@ -278,13 +417,19 @@ impl WatchState {
                 }
             }
         }
-        names.len()
+        match bloom {
+            Some(bloom) => names.iter().filter(|name| bloom.contains(name)).count(),
+            None => names.len(),
+        }
     }
 
     fn reset_view(&mut self) {
-        self.docs.clear();
+        // The view survives a restart: its documents must be
+        // re-confirmed by the re-run and are accounted for at
+        // the first consistent point (see `restart_unconfirmed`).
+        self.restart_unconfirmed.extend(self.docs.keys().cloned());
         self.pending.clear();
-        self.unconfirmed.clear();
+        self.restart_was_current = self.current_received;
         self.current_received = false;
         self.resume_token = None;
     }
@@ -402,13 +547,83 @@ impl WatchState {
     /// Applies pending changes and, if the view changed (or
     /// nothing was ever emitted and an empty snapshot is allowed
     /// at this point), produces the next snapshot.
+    /// Applies a held existence filter at a consistent point.
+    /// The server's count must match our view (pending changes
+    /// applied). With a bloom filter, only the view documents
+    /// that pass it count — the ones that fail are definitely
+    /// gone from the server's set and become
+    /// restart-unconfirmed (limbo candidates or synthesized
+    /// deletes, per the caller's policy). On a count mismatch
+    /// we missed changes while resuming: the whole view becomes
+    /// restart-unconfirmed, the resume token is dropped, and
+    /// the restart is reported via `take_filter_restart`.
+    /// Deliveries already in flight still land in this
+    /// snapshot; the re-run re-confirms the rest.
+    fn apply_pending_filter(&mut self) {
+        let Some(outcome) = self.pending_filter.take() else {
+            return;
+        };
+        self.filter_applied = true;
+        match outcome {
+            FilterOutcome::Mismatch => {
+                self.restart_unconfirmed.extend(self.docs.keys().cloned());
+                self.restart_was_current = self.current_received;
+                self.current_received = false;
+                self.resume_token = None;
+                self.filter_restart = true;
+            }
+            FilterOutcome::Match { failing } => {
+                for name in failing {
+                    if self.docs.contains_key(&name) {
+                        self.restart_unconfirmed.insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drains the deferred-filter restart signal.
+    pub(crate) fn take_filter_restart(&mut self) -> bool {
+        std::mem::take(&mut self.filter_restart)
+    }
+
+    /// Drains the deferred-filter application signal.
+    // Exercised by the spec-test harness (and staged for
+    // store-backed watches in the driver).
+    #[allow(dead_code)]
+    pub(crate) fn take_filter_applied(&mut self) -> bool {
+        std::mem::take(&mut self.filter_applied)
+    }
+
     fn emit(&mut self, read_time: Option<Timestamp>, allow_empty: bool) -> Option<WatchEvent> {
+        self.apply_pending_filter();
         // First consistent point of a freshly added target:
         // seeded documents the server never re-confirmed are
-        // deleted from the view (synthesized deletes).
+        // deleted from the view (synthesized deletes), or —
+        // with the limbo policy — reported as limbo candidates
+        // while staying in the view.
         if self.current_received && !self.unconfirmed.is_empty() {
-            for name in std::mem::take(&mut self.unconfirmed) {
-                self.docs.remove(&name);
+            let names = std::mem::take(&mut self.unconfirmed);
+            if self.keep_restart_unconfirmed {
+                self.limbo_candidates.extend(names);
+            } else {
+                for name in names {
+                    self.docs.remove(&name);
+                }
+            }
+        }
+        if (self.current_received || (self.restart_was_current && !self.keep_restart_unconfirmed))
+            && !self.restart_unconfirmed.is_empty()
+        {
+            let names = std::mem::take(&mut self.restart_unconfirmed);
+            if self.keep_restart_unconfirmed {
+                // The documents stay in the view; the caller
+                // resolves them individually (limbo resolution).
+                self.limbo_candidates.extend(names);
+            } else {
+                for name in names {
+                    self.docs.remove(&name);
+                }
             }
         }
         for (name, change) in std::mem::take(&mut self.pending) {
@@ -650,6 +865,53 @@ pub(crate) fn spawn_watch(
     Listener { receiver, task }
 }
 
+/// How the watch driver reacts to one processed response.
+enum ResponseAction {
+    /// Keep listening; nothing to deliver.
+    Continue,
+    /// Deliver this snapshot and keep listening.
+    Deliver(Snapshot),
+    /// Deliver this snapshot first (if any), then re-add the
+    /// target on a fresh stream: an existence-filter mismatch
+    /// was applied at a consistent point and the target's view
+    /// was reset.
+    Restart(Option<Snapshot>),
+    /// The target was removed; the listener ends. Carries the
+    /// removal error, if any, to deliver before ending.
+    Removed(Option<Error>),
+}
+
+/// Feeds one response to the watch state and decides the
+/// driver's reaction. The filter-restart signal is drained
+/// after *every* processed response, not only when a snapshot
+/// was emitted: applying a mismatching filter to an
+/// already-delivered empty view emits nothing (the diff is
+/// empty and the initial snapshot already went out), but the
+/// target must still be re-added without its token, or the
+/// listener would stay empty indefinitely while the server
+/// reports documents it should hold.
+fn response_action(state: &mut WatchState, response: ListenResponse) -> ResponseAction {
+    let event = state.on_response(response);
+    let restart = state.take_filter_restart();
+    match event {
+        Some(WatchEvent::Snapshot(snapshot)) => {
+            if restart {
+                ResponseAction::Restart(Some(snapshot))
+            } else {
+                ResponseAction::Deliver(snapshot)
+            }
+        }
+        Some(WatchEvent::Removed(error)) => ResponseAction::Removed(error),
+        None => {
+            if restart {
+                ResponseAction::Restart(None)
+            } else {
+                ResponseAction::Continue
+            }
+        }
+    }
+}
+
 async fn run_watch(
     channel: Channel,
     options: FirebaseOptions,
@@ -729,24 +991,27 @@ async fn run_watch(
         let mut restart = false;
         loop {
             match stream.message().await {
-                Ok(Some(response)) => match state.on_response(response) {
-                    Some(WatchEvent::Snapshot(snapshot)) => {
+                Ok(Some(response)) => match response_action(&mut state, response) {
+                    ResponseAction::Deliver(snapshot) => {
                         backoff.reset();
                         if sender.send(Ok(snapshot)).await.is_err() {
                             return;
                         }
                     }
-                    Some(WatchEvent::Restart) => {
+                    ResponseAction::Restart(snapshot) => {
                         restart = true;
+                        if let Some(snapshot) = snapshot {
+                            let _ = sender.send(Ok(snapshot)).await;
+                        }
                         break;
                     }
-                    Some(WatchEvent::Removed(error)) => {
+                    ResponseAction::Removed(error) => {
                         if let Some(error) = error {
                             let _ = sender.send(Err(error)).await;
                         }
                         return;
                     }
-                    None => {}
+                    ResponseAction::Continue => {}
                 },
                 Ok(None) => break, // Server closed the stream; reconnect.
                 Err(status) => {
@@ -1036,7 +1301,9 @@ mod tests {
         let mut state = watch();
         state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
         state.on_response(target_change(Type::Current, Some((1, 0)), b""));
-        // Server says two documents match; we hold one.
+        // Server says two documents match; we hold one. The
+        // filter is held until the next consistent point: no
+        // immediate event.
         let event = state.on_response(ListenResponse {
             response_type: Some(ResponseType::Filter(ExistenceFilter {
                 target_id: TARGET_ID,
@@ -1044,7 +1311,13 @@ mod tests {
                 unchanged_names: None,
             })),
         });
-        assert!(matches!(event, Some(WatchEvent::Restart)));
+        assert!(event.is_none());
+        assert!(!state.take_filter_restart());
+        // At the consistent point the mismatch applies: the
+        // restart is signaled and the resume token is dropped.
+        state.on_response(no_change_at(2));
+        assert!(state.take_filter_restart());
+        assert_eq!(state.resume_token(), None);
         // A matching count is a no-op.
         let mut state = watch();
         state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
@@ -1057,6 +1330,87 @@ mod tests {
             })),
         });
         assert!(event.is_none());
+        state.on_response(no_change_at(2));
+        assert!(!state.take_filter_restart());
+    }
+
+    #[test]
+    fn driver_restarts_on_filter_mismatch_without_snapshot() {
+        // The empty-view mismatch: an empty CURRENT snapshot is
+        // delivered, then an existence filter reports a document
+        // the client does not hold. At the next consistent point
+        // the watch state emits nothing (the diff is empty and
+        // the initial snapshot already went out), but the driver
+        // must still re-add the target — draining the restart
+        // signal only on snapshots would leave the listener
+        // empty indefinitely.
+        let mut state = watch();
+        let action = response_action(
+            &mut state,
+            target_change(Type::Current, Some((1, 0)), b"tok"),
+        );
+        assert!(
+            matches!(action, ResponseAction::Deliver(_)),
+            "the empty CURRENT snapshot is delivered"
+        );
+        let action = response_action(
+            &mut state,
+            ListenResponse {
+                response_type: Some(ResponseType::Filter(ExistenceFilter {
+                    target_id: TARGET_ID,
+                    count: 1,
+                    unchanged_names: None,
+                })),
+            },
+        );
+        assert!(
+            matches!(action, ResponseAction::Continue),
+            "the filter is held until the consistent point"
+        );
+        let action = response_action(&mut state, no_change_at(2));
+        assert!(
+            matches!(action, ResponseAction::Restart(None)),
+            "the mismatch restarts the target even without a snapshot"
+        );
+        assert_eq!(state.resume_token(), None);
+        // A matching filter at the barrier is not a restart.
+        let mut state = watch();
+        response_action(
+            &mut state,
+            target_change(Type::Current, Some((1, 0)), b"tok"),
+        );
+        response_action(
+            &mut state,
+            ListenResponse {
+                response_type: Some(ResponseType::Filter(ExistenceFilter {
+                    target_id: TARGET_ID,
+                    count: 0,
+                    unchanged_names: None,
+                })),
+            },
+        );
+        let action = response_action(&mut state, no_change_at(2));
+        assert!(matches!(action, ResponseAction::Continue));
+        // A mismatch on a non-empty view still restarts, with
+        // the removal snapshot delivered first.
+        let mut state = watch();
+        response_action(&mut state, change("notes/a", &[("n", Value::Integer(1))]));
+        response_action(&mut state, target_change(Type::Current, Some((1, 0)), b""));
+        response_action(
+            &mut state,
+            ListenResponse {
+                response_type: Some(ResponseType::Filter(ExistenceFilter {
+                    target_id: TARGET_ID,
+                    count: 2,
+                    unchanged_names: None,
+                })),
+            },
+        );
+        let action = response_action(&mut state, no_change_at(2));
+        assert!(
+            matches!(action, ResponseAction::Restart(Some(_))),
+            "a non-empty mismatch restarts with its snapshot"
+        );
     }
 
     #[test]
