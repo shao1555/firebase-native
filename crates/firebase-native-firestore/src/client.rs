@@ -590,7 +590,48 @@ impl Firestore {
     /// Runs a structured query. `parent_path` is the relative path of
     /// the parent document for subcollections, or empty for a root
     /// collection.
+    ///
+    /// In persistent mode the local store answers, mirroring
+    /// `get_document`'s rule: when the store knows the collection
+    /// (a cached document or a queued mutation in it), the query
+    /// is evaluated over the local views — unacknowledged writes
+    /// included — and no network call is made. When the store
+    /// knows nothing about the collection, an online query runs
+    /// first (unpaginated, so the local evaluation applies
+    /// offset/limit exactly once), its results are cached, and
+    /// the answer is the local evaluation over the filled store;
+    /// if that fetch fails with a connectivity error, the local
+    /// evaluation — possibly empty — is the answer rather than
+    /// an error. Validation and terminal service errors always
+    /// propagate.
     pub async fn run_query(&self, parent_path: &str, query: Query) -> Result<Vec<Document>> {
+        if !parent_path.is_empty() {
+            validate_document_path(parent_path)?;
+        }
+        if let Some(engine) = &self.engine {
+            if engine.collection_known(parent_path, query.collection_id())? {
+                return engine.local_query(parent_path, &query);
+            }
+            match self
+                .run_query_online(parent_path, query.without_pagination())
+                .await
+            {
+                Ok(documents) => {
+                    for document in &documents {
+                        engine.store_remote_document(document)?;
+                    }
+                    return engine.local_query(parent_path, &query);
+                }
+                Err(error) if crate::listen::is_transient_error(&error) => {
+                    return engine.local_query(parent_path, &query);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.run_query_online(parent_path, query).await
+    }
+
+    async fn run_query_online(&self, parent_path: &str, query: Query) -> Result<Vec<Document>> {
         let parent = if parent_path.is_empty() {
             self.options.documents_prefix()
         } else {
@@ -794,6 +835,34 @@ mod tests {
     }
 
     use super::*;
+
+    /// `run_query` validates the parent path before choosing a
+    /// source: in persistent mode an invalid parent must not be
+    /// swallowed by the local fallback as an empty result.
+    #[tokio::test]
+    async fn persistent_run_query_validates_parent_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "firebase-native-run-query-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+
+        let options = FirebaseOptions::new("test-key", "test-project").with_database_id("testdb");
+        let app = App::new(options);
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint("http://127.0.0.1:9")
+            .enable_local_store(&store_path)
+            .unwrap();
+        // "notes" is a collection path, not a document parent.
+        let result = firestore.run_query("notes", Query::new("sub")).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn routing_header_encodes_default_database() {

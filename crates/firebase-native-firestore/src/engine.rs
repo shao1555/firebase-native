@@ -304,6 +304,95 @@ impl PersistenceEngine {
         self.store.has_pending_mutation_for(relative_path)
     }
 
+    /// The collection prefix (relative, trailing slash) a query
+    /// under `parent_relative` scans: `notes/` at the root,
+    /// `spaces/personal/notes/` below a document.
+    fn collection_prefix(parent_relative: &str, collection_id: &str) -> String {
+        if parent_relative.is_empty() {
+            format!("{collection_id}/")
+        } else {
+            format!("{parent_relative}/{collection_id}/")
+        }
+    }
+
+    /// The direct children of the collection among `keys`
+    /// (relative paths): a key belongs when it sits exactly one
+    /// segment below the collection prefix.
+    fn collection_members<'a>(prefix: &str, keys: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+        keys.filter(|key| {
+            key.strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
+        .collect()
+    }
+
+    /// Evaluates a query over the local store: the candidates
+    /// are the collection's direct children known to the store —
+    /// server-confirmed documents plus every document a queued
+    /// mutation touches — each resolved through the local view
+    /// (so unacknowledged writes are visible), then filtered,
+    /// ordered and limited by the query itself. Index-free, like
+    /// the official client: candidates are scanned in memory.
+    pub(crate) fn local_query(
+        &self,
+        parent_relative: &str,
+        query: &crate::query::Query,
+    ) -> Result<Vec<Document>> {
+        let prefix = Self::collection_prefix(parent_relative, query.collection_id());
+        let mut keys: Vec<String> = Vec::new();
+        for document in self.store.all_remote_documents()? {
+            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
+                let relative = relative.strip_prefix('/').unwrap_or(relative);
+                keys.push(relative.to_string());
+            }
+        }
+        for batch in self.store.peek_batches(usize::MAX)? {
+            for mutation in &batch.mutations {
+                keys.push(mutation.path().to_string());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut candidates = Vec::new();
+        for key in Self::collection_members(&prefix, key_refs.into_iter()) {
+            if let Some(document) = self.local_document(key)? {
+                candidates.push(document);
+            }
+        }
+        Ok(query.evaluate(candidates))
+    }
+
+    /// Whether the store knows anything about a collection: at
+    /// least one server-confirmed document in it, or a queued
+    /// mutation touching one of its documents. Reads use this to
+    /// decide whether a local answer can be trusted as complete
+    /// or an online fetch must fill the gap first (mirroring
+    /// `get_document`'s local-first rule).
+    pub(crate) fn collection_known(
+        &self,
+        parent_relative: &str,
+        collection_id: &str,
+    ) -> Result<bool> {
+        let prefix = Self::collection_prefix(parent_relative, collection_id);
+        for document in self.store.all_remote_documents()? {
+            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
+                let relative = relative.strip_prefix('/').unwrap_or(relative);
+                if !Self::collection_members(&prefix, [relative].into_iter()).is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        for batch in self.store.peek_batches(usize::MAX)? {
+            for mutation in &batch.mutations {
+                if !Self::collection_members(&prefix, [mutation.path()].into_iter()).is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Records a server-confirmed document (e.g. an online fetch
     /// that populated the cache).
     pub(crate) fn store_remote_document(&self, document: &Document) -> Result<()> {
@@ -583,6 +672,74 @@ mod tests {
             .reconcile_fetched_document("notes/b", Some(&document_b), captured_b)
             .unwrap();
         assert!(engine.local_document("notes/b").unwrap().is_some());
+    }
+
+    fn remote_doc(relative: &str, n: i64) -> Document {
+        let mut fields = Fields::new();
+        fields.insert("n".to_string(), Value::Integer(n));
+        Document {
+            name: format!("projects/p/databases/d/documents/{relative}"),
+            fields,
+            create_time: None,
+            update_time: Some(crate::value::Timestamp::new(10, 0)),
+        }
+    }
+
+    #[test]
+    fn local_query_scans_collection_and_overlays_pending() {
+        let engine = test_engine();
+        engine
+            .store_remote_document(&remote_doc("notes/b", 1))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("notes/a", 2))
+            .unwrap();
+        // A nested subcollection document is not a member of notes.
+        engine
+            .store_remote_document(&remote_doc("notes/a/sub/x", 9))
+            .unwrap();
+        // A pending local write creates a third member.
+        engine.store().enqueue_batch(&[set("notes/c", 3)]).unwrap();
+
+        let query = crate::query::Query::new("notes").order_by(crate::query::Order::asc("n"));
+        let results = engine.local_query("", &query).unwrap();
+        let paths: Vec<&str> = results
+            .iter()
+            .map(|document| document.name.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(paths, ["b", "a", "c"]);
+
+        // A pending delete removes the document from the results.
+        engine
+            .store()
+            .enqueue_batch(&[Mutation::Delete {
+                path: "notes/a".to_string(),
+            }])
+            .unwrap();
+        let results = engine.local_query("", &query).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Subcollection queries address their own parent.
+        let sub = crate::query::Query::new("sub");
+        let results = engine.local_query("notes/a", &sub).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(engine.local_query("", &sub).unwrap().is_empty());
+    }
+
+    #[test]
+    fn collection_known_reflects_cache_and_queue() {
+        let engine = test_engine();
+        assert!(!engine.collection_known("", "notes").unwrap());
+        assert!(!engine.collection_known("spaces/personal", "notes").unwrap());
+        engine
+            .store_remote_document(&remote_doc("notes/a", 1))
+            .unwrap();
+        assert!(engine.collection_known("", "notes").unwrap());
+        // The cache row belongs to the root collection only.
+        assert!(!engine.collection_known("spaces/personal", "notes").unwrap());
+        // A queued mutation also marks its collection known.
+        engine.store().enqueue_batch(&[set("other/x", 1)]).unwrap();
+        assert!(engine.collection_known("", "other").unwrap());
     }
 
     #[test]
