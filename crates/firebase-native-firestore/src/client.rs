@@ -8,15 +8,15 @@ use firebase_native_core::{App, Error, FirebaseOptions, Result, TokenProvider};
 
 use crate::google::firestore::v1::firestore_client::FirestoreClient;
 use crate::google::firestore::v1::{
-    CreateDocumentRequest, DeleteDocumentRequest, DocumentMask, GetDocumentRequest,
+    CommitRequest, CreateDocumentRequest, DeleteDocumentRequest, DocumentMask, GetDocumentRequest,
     ListDocumentsRequest, RunQueryRequest, UpdateDocumentRequest,
 };
 use crate::path::{
     full_document_name, split_collection, validate_collection_path, validate_document_path,
 };
 use crate::query::Query;
-use crate::value::{fields_to_proto, Document};
-use crate::Fields;
+use crate::value::{fields_to_proto, Document, FieldValue};
+use crate::{FieldValues, Fields};
 
 const DEFAULT_ENDPOINT: &str = "https://firestore.googleapis.com";
 
@@ -472,29 +472,7 @@ impl Firestore {
     ) -> Result<Document> {
         if let Some(engine) = &self.engine {
             validate_document_path(path)?;
-            // An update patches an existing document, so it needs a
-            // known base. When the local view has none, establish
-            // the base from the server first: a missing document is
-            // NotFound and an unreachable server is an error — and
-            // in both cases nothing is queued, so an update that is
-            // returned as failed never takes effect later behind
-            // the caller's back. (A queued delete ahead of it also
-            // leaves the view empty; the update then fails the same
-            // way it will on the server.)
-            if engine.local_document(path)?.is_none() {
-                match self.get_document_online(path).await {
-                    Ok(Some(document)) => engine.store_remote_document(&document)?,
-                    Ok(None) => {
-                        return Err(Error::NotFound(format!("no document exists at {path}")));
-                    }
-                    Err(error) => return Err(error),
-                }
-                if engine.local_document(path)?.is_none() {
-                    return Err(Error::NotFound(format!(
-                        "document at {path} is not present in the local view"
-                    )));
-                }
-            }
+            self.ensure_local_base(engine, path).await?;
             return self.enqueue_and_view(
                 engine,
                 crate::mutation::Mutation::Patch {
@@ -509,6 +487,121 @@ impl Firestore {
         }
         self.update_document_with_mask(path, fields, field_mask)
             .await
+    }
+
+    /// Establishes a local base for a patch-style update in
+    /// persistent mode. An update patches an existing document,
+    /// so it needs a known base: when the local view has none,
+    /// fetch the document from the server first. A missing
+    /// document is NotFound and an unreachable server is an
+    /// error — and in both cases nothing is queued, so an update
+    /// that is returned as failed never takes effect later
+    /// behind the caller's back. (A queued delete ahead of it
+    /// also leaves the view empty; the update then fails the
+    /// same way it will on the server.)
+    async fn ensure_local_base(
+        &self,
+        engine: &Arc<crate::engine::PersistenceEngine>,
+        path: &str,
+    ) -> Result<()> {
+        if engine.local_document(path)?.is_none() {
+            match self.get_document_online(path).await {
+                Ok(Some(document)) => engine.store_remote_document(&document)?,
+                Ok(None) => {
+                    return Err(Error::NotFound(format!("no document exists at {path}")));
+                }
+                Err(error) => return Err(error),
+            }
+            if engine.local_document(path)?.is_none() {
+                return Err(Error::NotFound(format!(
+                    "document at {path} is not present in the local view"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits one mutation through the unary Commit RPC — the
+    /// online form of the Write stream's single-batch commit.
+    /// The unary UpdateDocument RPC cannot express field
+    /// transforms, so the sentinel writes take this route (as
+    /// the official SDKs do).
+    async fn commit_mutation(&self, mutation: &crate::mutation::Mutation) -> Result<()> {
+        let database = self.options.database_name();
+        let write = mutation.to_proto(&self.options.documents_prefix());
+        self.call(move |mut client| {
+            let database = database.clone();
+            let write = write.clone();
+            async move {
+                client
+                    .commit(CommitRequest {
+                        database,
+                        writes: vec![write],
+                        transaction: Vec::new(),
+                        request_options: None,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await
+    }
+
+    /// Sets a document from [`FieldValues`]: literal values plus
+    /// [`FieldValue`] sentinels (server timestamp, increment,
+    /// array union/remove, field delete), addressed by field
+    /// path. With `merge`, only the named fields are affected
+    /// and `Delete` removes its field; without it the document
+    /// is replaced wholesale and `Delete` is rejected.
+    ///
+    /// In persistent mode the write is queued locally like any
+    /// other; online it is committed through the Commit RPC
+    /// (the unary update RPC cannot express transforms) and the
+    /// result is read back, so the returned document carries
+    /// the server's exact transform results.
+    pub async fn set_document_with(
+        &self,
+        path: &str,
+        values: FieldValues,
+        merge: bool,
+    ) -> Result<Document> {
+        validate_document_path(path)?;
+        let mutation = set_mutation(path, &values, merge)?;
+        if let Some(engine) = &self.engine {
+            return self.enqueue_and_view(engine, mutation, path);
+        }
+        self.commit_mutation(&mutation).await?;
+        self.get_document_online(path)
+            .await?
+            .ok_or_else(|| Error::Other(format!("document missing after commit: {path}")))
+    }
+
+    /// Updates an existing document from [`FieldValues`]:
+    /// literal values plus [`FieldValue`] sentinels, addressed
+    /// by field path. The document must exist (in persistent
+    /// mode a base is established first, exactly as in
+    /// [`Firestore::update_document`]); a missing document is
+    /// NotFound.
+    pub async fn update_document_with(&self, path: &str, values: FieldValues) -> Result<Document> {
+        validate_document_path(path)?;
+        let mutation = patch_mutation(path, &values)?;
+        if let Some(engine) = &self.engine {
+            self.ensure_local_base(engine, path).await?;
+            return self.enqueue_and_view(engine, mutation, path);
+        }
+        self.commit_mutation(&mutation)
+            .await
+            .map_err(|error| match error {
+                // The mutation's exists precondition failed on the
+                // server: report it the way the persistent path does.
+                Error::Rpc { code, .. } if code == "FailedPrecondition" => {
+                    Error::NotFound(format!("no document exists at {path}"))
+                }
+                other => other,
+            })?;
+        self.get_document_online(path)
+            .await?
+            .ok_or_else(|| Error::Other(format!("document missing after commit: {path}")))
     }
 
     async fn update_document_with_mask(
@@ -703,6 +796,148 @@ impl Firestore {
         }
         Ok(documents)
     }
+}
+
+/// The pieces a [`FieldValues`] map decomposes into: the literal
+/// fields (path keys folded into nested maps), the paths they
+/// occupy, the paths to delete, and the server transforms.
+struct TranslatedValues {
+    fields: Fields,
+    set_paths: Vec<String>,
+    delete_paths: Vec<String>,
+    transforms: Vec<crate::mutation::FieldTransform>,
+}
+
+/// Decomposes [`FieldValues`] for the mutation layer. Rejects
+/// an empty map, a malformed field path, two keys denoting the
+/// same parsed field or nesting under another entry's path
+/// (the mutation model's literal and transform paths must be
+/// disjoint, and a scalar cannot also be a parent map), and a
+/// non-numeric increment operand.
+fn translate_values(values: &FieldValues) -> Result<TranslatedValues> {
+    if values.is_empty() {
+        return Err(Error::InvalidArgument("no field values given".to_string()));
+    }
+    // Validate syntax before anything is enqueued, and compare
+    // parsed segments: two distinct keys can still denote the
+    // same field (`n` vs `` `n` ``), and equality is as much a
+    // conflict as ancestry.
+    let mut parsed: Vec<(&String, Vec<String>)> = Vec::with_capacity(values.len());
+    for path in values.keys() {
+        parsed.push((path, crate::path::validate_field_path(path)?));
+    }
+    for (index, (a, a_segments)) in parsed.iter().enumerate() {
+        for (b, b_segments) in &parsed[index + 1..] {
+            if a_segments == b_segments {
+                return Err(Error::InvalidArgument(format!(
+                    "field paths {a} and {b} denote the same field"
+                )));
+            }
+            let (shorter, longer) = if a_segments.len() <= b_segments.len() {
+                (a_segments, b_segments)
+            } else {
+                (b_segments, a_segments)
+            };
+            if shorter.len() < longer.len() && longer[..shorter.len()] == shorter[..] {
+                return Err(Error::InvalidArgument(format!(
+                    "field paths {a} and {b} overlap"
+                )));
+            }
+        }
+    }
+    let mut translated = TranslatedValues {
+        fields: Fields::new(),
+        set_paths: Vec::new(),
+        delete_paths: Vec::new(),
+        transforms: Vec::new(),
+    };
+    for (path, value) in values {
+        match value {
+            FieldValue::Value(value) => {
+                crate::mutation::set_path(&mut translated.fields, path, value.clone());
+                translated.set_paths.push(path.clone());
+            }
+            FieldValue::Delete => translated.delete_paths.push(path.clone()),
+            FieldValue::ServerTimestamp => {
+                translated.transforms.push(crate::mutation::FieldTransform {
+                    path: path.clone(),
+                    kind: crate::mutation::TransformKind::ServerTimestamp,
+                });
+            }
+            FieldValue::Increment(operand) => {
+                if !operand.is_number() {
+                    return Err(Error::InvalidArgument(format!(
+                        "increment operand for {path} must be a number"
+                    )));
+                }
+                translated.transforms.push(crate::mutation::FieldTransform {
+                    path: path.clone(),
+                    kind: crate::mutation::TransformKind::Increment(operand.clone()),
+                });
+            }
+            FieldValue::ArrayUnion(elements) => {
+                translated.transforms.push(crate::mutation::FieldTransform {
+                    path: path.clone(),
+                    kind: crate::mutation::TransformKind::ArrayUnion(elements.clone()),
+                });
+            }
+            FieldValue::ArrayRemove(elements) => {
+                translated.transforms.push(crate::mutation::FieldTransform {
+                    path: path.clone(),
+                    kind: crate::mutation::TransformKind::ArrayRemove(elements.clone()),
+                });
+            }
+        }
+    }
+    Ok(translated)
+}
+
+/// Builds the `Set` mutation for `set_document_with`: with
+/// `merge`, the merge paths are exactly the literal and deleted
+/// paths (transforms travel separately); without it the
+/// document is replaced and a field delete has no meaning.
+fn set_mutation(
+    path: &str,
+    values: &FieldValues,
+    merge: bool,
+) -> Result<crate::mutation::Mutation> {
+    let translated = translate_values(values)?;
+    if !merge && !translated.delete_paths.is_empty() {
+        return Err(Error::InvalidArgument(
+            "FieldValue::Delete cannot be used in a non-merge set; the document is replaced"
+                .to_string(),
+        ));
+    }
+    let merge_paths = merge.then(|| {
+        let mut paths = translated.set_paths.clone();
+        paths.extend(translated.delete_paths.iter().cloned());
+        paths.sort();
+        paths
+    });
+    Ok(crate::mutation::Mutation::Set {
+        path: path.to_string(),
+        fields: translated.fields,
+        merge_paths,
+        exists: None,
+        transforms: translated.transforms,
+    })
+}
+
+/// Builds the `Patch` mutation for `update_document_with`: the
+/// mask is exactly the literal and deleted paths, and the
+/// document must exist.
+fn patch_mutation(path: &str, values: &FieldValues) -> Result<crate::mutation::Mutation> {
+    let translated = translate_values(values)?;
+    let mut mask = translated.set_paths.clone();
+    mask.extend(translated.delete_paths.iter().cloned());
+    mask.sort();
+    Ok(crate::mutation::Mutation::Patch {
+        path: path.to_string(),
+        fields: translated.fields,
+        mask,
+        exists: Some(true),
+        transforms: translated.transforms,
+    })
 }
 
 /// A stable key for a watch target's row in the local store's
@@ -936,5 +1171,182 @@ mod tests {
             map_status(Status::unavailable("later")),
             Error::Rpc { .. }
         ));
+    }
+
+    fn sample_values() -> FieldValues {
+        let mut values = FieldValues::new();
+        values.insert(
+            "title".to_string(),
+            FieldValue::Value(Value::String("hello".to_string())),
+        );
+        values.insert("old".to_string(), FieldValue::Delete);
+        values.insert("at".to_string(), FieldValue::ServerTimestamp);
+        values.insert(
+            "stats.count".to_string(),
+            FieldValue::Increment(Value::Integer(2)),
+        );
+        values.insert(
+            "tags".to_string(),
+            FieldValue::ArrayUnion(vec![Value::String("x".to_string())]),
+        );
+        values
+    }
+
+    #[test]
+    fn patch_translation_separates_literals_deletes_and_transforms() {
+        let mutation = patch_mutation("notes/a", &sample_values()).unwrap();
+        let crate::mutation::Mutation::Patch {
+            fields,
+            mask,
+            exists,
+            transforms,
+            ..
+        } = mutation
+        else {
+            panic!("expected a patch mutation");
+        };
+        assert_eq!(exists, Some(true));
+        // The mask is exactly the literal and deleted paths;
+        // transform paths travel separately.
+        assert_eq!(mask, ["old", "title"]);
+        assert_eq!(
+            fields.get("title"),
+            Some(&Value::String("hello".to_string()))
+        );
+        assert_eq!(fields.len(), 1);
+        let transform_paths: Vec<&str> = transforms
+            .iter()
+            .map(|transform| transform.path.as_str())
+            .collect();
+        assert_eq!(transform_paths, ["at", "stats.count", "tags"]);
+    }
+
+    #[test]
+    fn set_translation_merge_paths_and_delete_rules() {
+        let mutation = set_mutation("notes/a", &sample_values(), true).unwrap();
+        let crate::mutation::Mutation::Set { merge_paths, .. } = mutation else {
+            panic!("expected a set mutation");
+        };
+        assert_eq!(
+            merge_paths,
+            Some(vec!["old".to_string(), "title".to_string()])
+        );
+        // A non-merge set replaces the document: a field delete
+        // has no meaning and is rejected.
+        let error = set_mutation("notes/a", &sample_values(), false).unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+        // Without deletes, a non-merge set carries no mask.
+        let mut values = sample_values();
+        values.remove("old");
+        let mutation = set_mutation("notes/a", &values, false).unwrap();
+        let crate::mutation::Mutation::Set { merge_paths, .. } = mutation else {
+            panic!("expected a set mutation");
+        };
+        assert_eq!(merge_paths, None);
+    }
+
+    #[test]
+    fn translation_rejects_invalid_inputs() {
+        // Empty.
+        assert!(matches!(
+            patch_mutation("notes/a", &FieldValues::new()),
+            Err(Error::InvalidArgument(_))
+        ));
+        // A path nesting under another entry's path.
+        let mut values = FieldValues::new();
+        values.insert("a".to_string(), FieldValue::Value(Value::Integer(1)));
+        values.insert("a.b".to_string(), FieldValue::Increment(Value::Integer(1)));
+        assert!(matches!(
+            patch_mutation("notes/a", &values),
+            Err(Error::InvalidArgument(_))
+        ));
+        // A non-numeric increment operand.
+        let mut values = FieldValues::new();
+        values.insert(
+            "n".to_string(),
+            FieldValue::Increment(Value::String("x".to_string())),
+        );
+        assert!(matches!(
+            patch_mutation("notes/a", &values),
+            Err(Error::InvalidArgument(_))
+        ));
+        // Malformed paths: empty, unquoted specials, an
+        // unterminated quote, an empty segment, a reserved name.
+        for bad in ["", "a b", "`n", "a..b", "__name__"] {
+            let mut values = FieldValues::new();
+            values.insert(bad.to_string(), FieldValue::Value(Value::Integer(1)));
+            assert!(
+                matches!(
+                    patch_mutation("notes/a", &values),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "path {bad:?} must be rejected"
+            );
+        }
+        // Two keys denoting the same parsed field.
+        let mut values = FieldValues::new();
+        values.insert("n".to_string(), FieldValue::Increment(Value::Integer(1)));
+        values.insert("`n`".to_string(), FieldValue::Increment(Value::Integer(1)));
+        assert!(matches!(
+            patch_mutation("notes/a", &values),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    /// The full local round trip of the sentinel API in
+    /// persistent mode: the queued mutations' local views apply
+    /// the transforms exactly as the mutation layer defines
+    /// (increment accumulates, a pending server timestamp reads
+    /// as Null, array remove empties, delete removes).
+    #[tokio::test]
+    async fn field_values_apply_in_the_local_view() {
+        let dir = std::env::temp_dir().join(format!(
+            "firebase-native-field-values-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+
+        let options = FirebaseOptions::new("test-key", "test-project").with_database_id("testdb");
+        let app = App::new(options);
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint("http://127.0.0.1:9")
+            .enable_local_store(&store_path)
+            .unwrap();
+
+        let mut values = FieldValues::new();
+        values.insert("n".to_string(), FieldValue::Increment(Value::Integer(3)));
+        values.insert("at".to_string(), FieldValue::ServerTimestamp);
+        values.insert(
+            "tags".to_string(),
+            FieldValue::ArrayUnion(vec![Value::String("x".to_string())]),
+        );
+        let created = firestore
+            .set_document_with("notes/a", values, true)
+            .await
+            .unwrap();
+        assert_eq!(created.fields.get("n"), Some(&Value::Integer(3)));
+        assert_eq!(created.fields.get("at"), Some(&Value::Null));
+        assert_eq!(
+            created.fields.get("tags"),
+            Some(&Value::Array(vec![Value::String("x".to_string())]))
+        );
+
+        let mut values = FieldValues::new();
+        values.insert("n".to_string(), FieldValue::Increment(Value::Integer(2)));
+        values.insert(
+            "tags".to_string(),
+            FieldValue::ArrayRemove(vec![Value::String("x".to_string())]),
+        );
+        values.insert("at".to_string(), FieldValue::Delete);
+        let updated = firestore
+            .update_document_with("notes/a", values)
+            .await
+            .unwrap();
+        assert_eq!(updated.fields.get("n"), Some(&Value::Integer(5)));
+        assert_eq!(updated.fields.get("tags"), Some(&Value::Array(vec![])));
+        assert!(!updated.fields.contains_key("at"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
