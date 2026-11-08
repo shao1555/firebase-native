@@ -210,7 +210,7 @@ impl PersistenceEngine {
     /// state: computes each touched document's post-ack state and
     /// commits it together with the queue removal as one store
     /// transaction.
-    fn fold_acknowledgement(
+    pub(crate) fn fold_acknowledgement(
         &self,
         batch: &crate::store::MutationBatch,
         commit_time: crate::value::Timestamp,
@@ -219,6 +219,20 @@ impl PersistenceEngine {
         for mutation in &batch.mutations {
             let name = full_document_name(&self.documents_prefix, mutation.path());
             let current = self.store.remote_document(&name)?;
+            // A watch delivery newer than this commit already
+            // reflects the mutation's effect (or a later state);
+            // folding the mutation over it would regress the
+            // base. The batch still completes; the base stands.
+            if let Some(existing) = &current {
+                if let Some(update_time) = &existing.update_time {
+                    if (update_time.seconds, update_time.nanos)
+                        > (commit_time.seconds, commit_time.nanos)
+                    {
+                        updates.push((name, current));
+                        continue;
+                    }
+                }
+            }
             let mut next = mutation.apply_to_remote(current, commit_time);
             if let Some(document) = next.as_mut() {
                 // A newly created document has no name yet (the
@@ -423,6 +437,46 @@ mod tests {
         );
         // And the local view still serves it after the ack.
         assert!(engine.local_document("notes/a").unwrap().is_some());
+    }
+
+    #[test]
+    fn fold_does_not_regress_a_newer_remote_base() {
+        // The watch delivered a newer server state of the
+        // document before the write's acknowledgement folded:
+        // folding the older mutation over it would regress the
+        // base. The batch still completes and dequeues.
+        let engine = test_engine();
+        let remote = Document {
+            name: "projects/p/databases/d/documents/notes/a".to_string(),
+            fields: {
+                let mut fields = Fields::new();
+                fields.insert("n".to_string(), Value::Integer(3));
+                fields
+            },
+            create_time: None,
+            update_time: Some(crate::value::Timestamp::new(300, 0)),
+        };
+        engine.store_remote_document(&remote).unwrap();
+        engine.store().enqueue_batch(&[set("notes/a", 2)]).unwrap();
+        let batch = engine.store().peek_batches(1).unwrap().remove(0);
+        engine
+            .fold_acknowledgement(&batch, crate::value::Timestamp::new(200, 0))
+            .unwrap();
+        assert_eq!(engine.store().batch_count().unwrap(), 0);
+        let cached = engine
+            .store()
+            .remote_document("projects/p/databases/d/documents/notes/a")
+            .unwrap()
+            .expect("base stands");
+        assert_eq!(
+            cached.fields.get("n"),
+            Some(&Value::Integer(3)),
+            "the newer watch-delivered state must not regress"
+        );
+        assert_eq!(
+            cached.update_time,
+            Some(crate::value::Timestamp::new(300, 0))
+        );
     }
 
     #[test]

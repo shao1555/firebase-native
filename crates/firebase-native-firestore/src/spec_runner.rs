@@ -19,11 +19,13 @@
 //! are reported as **skipped with a reason**, never silently
 //! passed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use firebase_native_core::Error;
 use serde_json::{Map, Value as Json};
 
+use crate::engine::PersistenceEngine;
 use crate::google::firestore::v1::listen_request::TargetChange as RequestTargetChange;
 use crate::google::firestore::v1::listen_response::ResponseType;
 use crate::google::firestore::v1::target::ResumeType;
@@ -33,8 +35,11 @@ use crate::google::firestore::v1::{
     TargetChange,
 };
 use crate::listen::{DocumentChange, DocumentChangeKind, Snapshot, WatchEvent, WatchState};
+use crate::mutation::Mutation;
 use crate::query::{FieldOp, Filter, Order, Query, UnaryOp};
+use crate::store::LocalStore;
 use crate::value::{fields_to_proto, Document, Timestamp, Value};
+use crate::write::WriteStream;
 use crate::Fields;
 
 const DOCUMENTS_PREFIX: &str = "projects/test-project/databases/test-db/documents";
@@ -198,6 +203,13 @@ fn parse_query(json: &Json) -> Result<Query, String> {
     Ok(query)
 }
 
+/// A streamed remote update buffered until the next accepted
+/// consistent point.
+enum RemoteUpdate {
+    Document(Document),
+    Absent(String, Option<i64>),
+}
+
 /// What the harness emitted for one step.
 enum Emitted {
     /// A snapshot from the watch state itself.
@@ -209,6 +221,21 @@ enum Emitted {
     /// (valid upstream cases leave them unasserted), while steps
     /// that do assert — even `[]` — compare them strictly.
     Pseudo(Snapshot),
+    /// A snapshot composed by the local layer in write mode: the
+    /// store's remote base overlaid with the queued mutations —
+    /// the production client's local view. Its cache/pending
+    /// metadata is compared exactly.
+    Composed {
+        snapshot: Snapshot,
+        from_cache: bool,
+        has_pending: bool,
+        /// Documents whose content is unchanged but whose
+        /// mutation state (pending / committed) changed.
+        metadata: Vec<Document>,
+        /// A listen-time initial view: like `Pseudo`, tolerated
+        /// on steps that assert no events.
+        initial: bool,
+    },
     Error(i32),
 }
 
@@ -270,6 +297,60 @@ struct Harness {
     /// deletes and leave the local store too.
     fresh_seed: bool,
     feed_snapshots: usize,
+    /// Write-mode state: cases with user writes run against the
+    /// real persistence engine on an in-memory store. Watch
+    /// results are applied to its store; listener events are
+    /// composed from it.
+    engine: Option<Arc<PersistenceEngine>>,
+    write_mode: bool,
+    /// The active listen's query path, for view membership.
+    query_path: String,
+    /// Relative keys the watch has placed in the store.
+    store_remote_keys: BTreeSet<String>,
+    /// The last composed snapshot delivered to the listener,
+    /// by relative key, and its metadata.
+    delivered_docs: BTreeMap<String, Document>,
+    delivered_meta: (bool, bool),
+    /// The active listen has received a server snapshot (its
+    /// view is no longer purely from cache).
+    synced: bool,
+    /// Write callbacks since the last `expectedState` check;
+    /// the spec model drains these at each check.
+    callback_acked: BTreeSet<String>,
+    callback_rejected: BTreeSet<String>,
+    /// `waitForPendingWrites` registrations: the highest batch
+    /// ID outstanding at registration, and whether resolved.
+    waiters: Vec<(i64, bool)>,
+    /// Waits resolved during the current step.
+    resolved_waits: usize,
+    /// Streamed remote updates not yet applied to the store:
+    /// they become visible only at an accepted consistent
+    /// point, never through an interleaved local operation.
+    pending_remote: Vec<RemoteUpdate>,
+    /// Documents whose writes were acknowledged and folded into
+    /// the base but not yet confirmed by the watch, by relative
+    /// key with the commit time (microseconds). Such documents
+    /// count toward `hasPendingWrites` and raise metadata
+    /// changes when their state flips.
+    committed_unconfirmed: BTreeMap<String, i64>,
+    /// Per-document mutation flags at the last delivered
+    /// composed snapshot: (has local mutations, has committed
+    /// mutations), by relative key.
+    delivered_flags: BTreeMap<String, (bool, bool)>,
+    /// Paths of the most recently settled batch, for absorbing
+    /// their flag flips when the settlement raises no event.
+    last_settled: Vec<String>,
+    /// Acknowledged mutations whose fold left no base row
+    /// (deletes, patches of absent documents), by relative key:
+    /// the commit time (microseconds) and whether a delivery
+    /// at exactly that version is also stale (it is for a
+    /// delete, whose own version carries the pre-delete state;
+    /// it is not for a patch, whose version carries the
+    /// patched state). Older deliveries must not resurrect
+    /// the document — the watch has not caught up.
+    folded_absent: BTreeMap<String, (i64, bool)>,
+    /// Whether this listen has delivered any composed snapshot.
+    delivered_valid: bool,
 }
 
 impl Harness {
@@ -294,6 +375,23 @@ impl Harness {
             cache: BTreeMap::new(),
             fresh_seed: false,
             feed_snapshots: 0,
+            engine: None,
+            write_mode: false,
+            query_path: String::new(),
+            store_remote_keys: BTreeSet::new(),
+            delivered_docs: BTreeMap::new(),
+            delivered_meta: (false, false),
+            synced: false,
+            callback_acked: BTreeSet::new(),
+            callback_rejected: BTreeSet::new(),
+            waiters: Vec::new(),
+            resolved_waits: 0,
+            committed_unconfirmed: BTreeMap::new(),
+            delivered_flags: BTreeMap::new(),
+            folded_absent: BTreeMap::new(),
+            pending_remote: Vec::new(),
+            last_settled: Vec::new(),
+            delivered_valid: false,
         }
     }
 
@@ -348,6 +446,34 @@ impl Harness {
     }
 
     fn feed(&mut self, response: ListenResponse, emitted: &mut Vec<Emitted>) {
+        // A NO_CHANGE barrier's read time confirms every
+        // committed write at or below it, and the barrier is
+        // where streamed confirmations surface as events.
+        let barrier_read_micros = match &response.response_type {
+            Some(ResponseType::TargetChange(change))
+                if change.target_change_type == TargetChangeType::NoChange as i32 =>
+            {
+                change
+                    .read_time
+                    .as_ref()
+                    .map(|time| time.seconds * 1_000_000 + (time.nanos / 1000) as i64)
+            }
+            _ => None,
+        };
+        if self.write_mode {
+            // Remote documents are buffered as they stream in
+            // and applied to the store at the next accepted
+            // consistent point, independently of whether the
+            // watch state raises a snapshot there: a
+            // confirmation whose fields are unchanged produces
+            // no snapshot but must still land.
+            self.apply_response_to_store(&response);
+            if let Some(read_micros) = barrier_read_micros {
+                self.flush_pending_remote();
+                self.committed_unconfirmed
+                    .retain(|_, commit| *commit > read_micros);
+            }
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -363,8 +489,10 @@ impl Harness {
                 self.target_tokens.remove(&self.target_id);
             }
         }
+        let mut snapshot_emitted = false;
         match event {
             Some(WatchEvent::Snapshot(snapshot)) => {
+                snapshot_emitted = true;
                 self.delivered_queries
                     .insert(self.current_query_sig.clone());
                 self.pending_view.clear();
@@ -390,7 +518,13 @@ impl Harness {
                     .iter()
                     .map(|doc| (key_of(&doc.name), doc.clone()))
                     .collect();
-                emitted.push(Emitted::Snapshot(snapshot));
+                if self.write_mode {
+                    self.apply_snapshot_to_store(&snapshot);
+                    let force = !self.delivered_valid;
+                    self.maybe_emit_composed(emitted, force, false, true);
+                } else {
+                    emitted.push(Emitted::Snapshot(snapshot));
+                }
             }
             Some(WatchEvent::Restart) => {
                 self.unexpected_restart = true;
@@ -402,9 +536,520 @@ impl Harness {
                     emitted.push(Emitted::Error(error_code(error)));
                 }
                 self.state = None;
+                self.pending_remote.clear();
             }
             None => {}
         }
+        if self.write_mode && !snapshot_emitted && barrier_read_micros.is_some() {
+            self.maybe_emit_metadata_only(emitted);
+        }
+    }
+}
+
+impl Harness {
+    /// Builds the persistence engine on an in-memory store with
+    /// an inert write stream: batches are enqueued directly in
+    /// the store and settled by the harness, exactly as the
+    /// engine's own unit tests drive it.
+    fn ensure_engine(&mut self) {
+        if self.engine.is_some() {
+            return;
+        }
+        struct StubTokens;
+        #[async_trait::async_trait]
+        impl firebase_native_core::TokenProvider for StubTokens {
+            async fn id_token(&self, _force_refresh: bool) -> firebase_native_core::Result<String> {
+                Ok("stub-token".to_string())
+            }
+        }
+        let options = firebase_native_core::FirebaseOptions {
+            api_key: "spec-test".to_string(),
+            project_id: "test-project".to_string(),
+            auth_domain: None,
+            storage_bucket: None,
+            app_id: None,
+            database_id: "test-db".to_string(),
+        };
+        let write = WriteStream::new(
+            options,
+            Arc::new(StubTokens),
+            Arc::new(tokio::sync::OnceCell::new()),
+            "https://firestore.googleapis.com".to_string(),
+        );
+        let store = Arc::new(LocalStore::open_in_memory().expect("in-memory store"));
+        self.engine = Some(Arc::new(PersistenceEngine::new(
+            store,
+            write,
+            DOCUMENTS_PREFIX.to_string(),
+        )));
+    }
+
+    /// Applies a watch snapshot to the store: documents upsert
+    /// (if newer), previously watched documents now absent are
+    /// recorded as removed.
+    fn apply_snapshot_to_store(&mut self, snapshot: &Snapshot) {
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for document in &snapshot.documents {
+            keys.insert(key_of(&document.name));
+            self.apply_remote_document(document);
+        }
+        let gone: Vec<String> = self.store_remote_keys.difference(&keys).cloned().collect();
+        for key in gone {
+            let _ = self
+                .engine
+                .as_ref()
+                .expect("write mode engine")
+                .store_remote_absent(&key);
+        }
+        self.store_remote_keys = keys;
+        self.synced = true;
+    }
+
+    /// Applies one streamed remote document to the store,
+    /// honoring folded-absent markers (an acknowledged delete
+    /// or patch folded at a newer version wins over a stale
+    /// delivery) and clearing watch confirmations.
+    fn apply_remote_document(&mut self, document: &Document) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let key = key_of(&document.name);
+        let micros = Self::doc_micros(document);
+        let stale = self
+            .folded_absent
+            .get(&key)
+            .map(|(commit, inclusive)| micros < *commit || (*inclusive && micros == *commit));
+        match stale {
+            Some(true) => return,
+            Some(false) => {
+                self.folded_absent.remove(&key);
+            }
+            None => {}
+        }
+        let confirmed = self
+            .committed_unconfirmed
+            .get(&key)
+            .map(|commit| micros >= *commit)
+            .unwrap_or(false);
+        if confirmed {
+            self.committed_unconfirmed.remove(&key);
+        }
+        let _ = engine.store_remote_document_if_newer(document);
+        self.store_remote_keys.insert(key);
+    }
+
+    /// Records a streamed removal in the store, unless the
+    /// store's base is already newer than the removal.
+    fn apply_remote_absent(&mut self, name: &str, read_micros: Option<i64>) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if let Some(read_micros) = read_micros {
+            let base_micros = engine
+                .store()
+                .remote_document(name)
+                .ok()
+                .flatten()
+                .map(|document| Self::doc_micros(&document))
+                .unwrap_or(0);
+            if base_micros > read_micros {
+                return;
+            }
+        }
+        let key = key_of(name);
+        let _ = engine.store_remote_absent(&key);
+        self.store_remote_keys.insert(key);
+    }
+
+    /// Buffers a streamed Listen response's document updates:
+    /// remote state becomes visible to the composed view only
+    /// at an accepted consistent point (see
+    /// `flush_pending_remote`), never through a local operation
+    /// interleaved before the barrier.
+    fn apply_response_to_store(&mut self, response: &ListenResponse) {
+        match &response.response_type {
+            Some(ResponseType::DocumentChange(change)) => {
+                if change.removed_target_ids.contains(&self.target_id) {
+                    if let Some(document) = &change.document {
+                        self.pending_remote
+                            .push(RemoteUpdate::Absent(document.name.clone(), None));
+                    }
+                } else if change.target_ids.is_empty()
+                    || change.target_ids.contains(&self.target_id)
+                {
+                    if let Some(proto) = &change.document {
+                        if let Ok(document) = Document::from_proto(proto.clone()) {
+                            self.pending_remote.push(RemoteUpdate::Document(document));
+                        }
+                    }
+                }
+            }
+            Some(ResponseType::DocumentDelete(delete)) => {
+                if delete.removed_target_ids.contains(&self.target_id) {
+                    let read_micros = delete
+                        .read_time
+                        .as_ref()
+                        .map(|time| time.seconds * 1_000_000 + (time.nanos / 1000) as i64);
+                    self.pending_remote
+                        .push(RemoteUpdate::Absent(delete.document.clone(), read_micros));
+                }
+            }
+            Some(ResponseType::DocumentRemove(remove))
+                if remove.removed_target_ids.contains(&self.target_id) =>
+            {
+                self.pending_remote
+                    .push(RemoteUpdate::Absent(remove.document.clone(), None));
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies the buffered streamed updates to the store, in
+    /// arrival order, at an accepted consistent point.
+    fn flush_pending_remote(&mut self) {
+        for update in std::mem::take(&mut self.pending_remote) {
+            match update {
+                RemoteUpdate::Document(document) => self.apply_remote_document(&document),
+                RemoteUpdate::Absent(name, read_micros) => {
+                    self.apply_remote_absent(&name, read_micros)
+                }
+            }
+        }
+    }
+
+    /// A delivery that changed no content can still confirm
+    /// committed writes; evaluate metadata-only movement then.
+    fn maybe_emit_metadata_only(&mut self, emitted: &mut Vec<Emitted>) {
+        if !self.delivered_valid {
+            // Nothing delivered yet for this listen: the first
+            // snapshot (with its metadata) belongs to the
+            // barrier path, not to streamed deliveries.
+            return;
+        }
+        let composed = self.composed_view();
+        let same_content = composed.len() == self.delivered_docs.len()
+            && composed.iter().all(|(key, document)| {
+                self.delivered_docs
+                    .get(key)
+                    .map(|old| old.fields == document.fields)
+                    .unwrap_or(false)
+            });
+        if same_content {
+            self.maybe_emit_composed(emitted, false, false, true);
+        }
+    }
+
+    /// The composed local view for the active query: every known
+    /// document (store base plus queued mutation paths) resolved
+    /// through the engine, filtered by path and query.
+    fn composed_view(&self) -> BTreeMap<String, Document> {
+        let (Some(engine), Some(query)) = (&self.engine, &self.query) else {
+            return BTreeMap::new();
+        };
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        if let Ok(documents) = engine.store().all_remote_documents() {
+            candidates.extend(documents.iter().map(|document| key_of(&document.name)));
+        }
+        if let Ok(batches) = engine.store().peek_batches(usize::MAX) {
+            for batch in &batches {
+                for mutation in &batch.mutations {
+                    candidates.insert(mutation_path(mutation).to_string());
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|key| path_matches(&self.query_path, key))
+            .filter_map(|key| {
+                let document = engine.local_document(&key).ok().flatten()?;
+                query.matches(&document).then_some((key, document))
+            })
+            .collect()
+    }
+
+    fn is_from_cache(&self) -> bool {
+        !self.online || !self.synced
+    }
+
+    /// Recomputes the composed view and, when it or its metadata
+    /// changed (or the caller forces a barrier event), delivers
+    /// it as the listener's next snapshot.
+    fn maybe_emit_composed(
+        &mut self,
+        emitted: &mut Vec<Emitted>,
+        force: bool,
+        initial: bool,
+        strict: bool,
+    ) {
+        if self.state.is_none() || self.unlistened || self.engine.is_none() {
+            return;
+        }
+        let composed = self.composed_view();
+        let engine = self.engine.as_ref().expect("engine checked");
+        let flags: BTreeMap<String, (bool, bool)> = composed
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    (
+                        engine.has_pending(key).unwrap_or(false),
+                        self.committed_unconfirmed.contains_key(key),
+                    ),
+                )
+            })
+            .collect();
+        let mut changes: Vec<DocumentChange> = Vec::new();
+        let mut metadata: Vec<Document> = Vec::new();
+        for (index, (key, document)) in composed.iter().enumerate() {
+            match self.delivered_docs.get(key) {
+                None => changes.push(DocumentChange {
+                    kind: DocumentChangeKind::Added,
+                    document: document.clone(),
+                    old_index: None,
+                    new_index: Some(index),
+                }),
+                Some(old) if old.fields != document.fields => {
+                    changes.push(DocumentChange {
+                        kind: DocumentChangeKind::Modified,
+                        document: document.clone(),
+                        old_index: None,
+                        new_index: Some(index),
+                    });
+                }
+                _ => {
+                    let was_local = self
+                        .delivered_flags
+                        .get(key)
+                        .map(|(local, _)| *local)
+                        .unwrap_or(false);
+                    let is_local = flags.get(key).map(|(local, _)| *local).unwrap_or(false);
+                    if !was_local && is_local {
+                        // Gaining an unacknowledged local mutation
+                        // is a modification, not a metadata change.
+                        changes.push(DocumentChange {
+                            kind: DocumentChangeKind::Modified,
+                            document: document.clone(),
+                            old_index: None,
+                            new_index: Some(index),
+                        });
+                    } else if self.delivered_flags.get(key) != flags.get(key) {
+                        metadata.push(document.clone());
+                    }
+                }
+            }
+        }
+        for (key, document) in &self.delivered_docs {
+            if !composed.contains_key(key) {
+                changes.push(DocumentChange {
+                    kind: DocumentChangeKind::Removed,
+                    document: document.clone(),
+                    old_index: None,
+                    new_index: None,
+                });
+            }
+        }
+        let has_pending = flags
+            .values()
+            .any(|(local, committed)| *local || *committed);
+        let meta = (self.is_from_cache(), has_pending);
+        // In non-strict mode (an acknowledgement whose effect
+        // the watch has not delivered) only content changes
+        // raise an event; flag and metadata flips are absorbed.
+        if changes.is_empty()
+            && (metadata.is_empty() || !strict)
+            && (meta == self.delivered_meta || !strict)
+            && !force
+        {
+            return;
+        }
+        self.delivered_docs = composed.clone();
+        self.delivered_flags = flags;
+        self.delivered_meta = meta;
+        self.delivered_valid = true;
+        self.delivered_queries
+            .insert(self.current_query_sig.clone());
+        emitted.push(Emitted::Composed {
+            snapshot: Snapshot {
+                documents: composed.into_values().collect(),
+                changes,
+                read_time: None,
+            },
+            from_cache: meta.0,
+            has_pending: meta.1,
+            metadata,
+            initial,
+        });
+    }
+
+    fn enqueue_spec(&mut self, mutation: Mutation) {
+        if let Some(engine) = &self.engine {
+            let _ = engine.store().enqueue_batch(&[mutation]);
+        }
+    }
+
+    /// Settles the oldest outstanding batch the way the spec's
+    /// `writeAck` / `failWrite` steps do: folded into the remote
+    /// base at the commit time, or dropped from the queue.
+    /// Returns whether any settled document already had a
+    /// remote base (the watch had delivered it): only then does
+    /// an acknowledgement raise a listener event.
+    fn settle_oldest(&mut self, ack: bool, commit: Timestamp) -> bool {
+        let Some(engine) = self.engine.clone() else {
+            return false;
+        };
+        let store = engine.store();
+        let Ok(batches) = store.peek_batches(1) else {
+            return false;
+        };
+        let Some(batch) = batches.into_iter().next() else {
+            return false;
+        };
+        // Whether the watch had already delivered every
+        // mutation's effect before the acknowledgement: the
+        // base carries a version at or beyond the commit for
+        // each mutated document. Only then does the
+        // acknowledgement itself raise an event (the documents'
+        // mutation flags flip in a server-confirmed view). A
+        // base that merely has the same fields at an older
+        // version does not count — the write's own version is
+        // not confirmed yet.
+        let commit_micros = commit.seconds * 1_000_000 + (commit.nanos / 1000) as i64;
+        let mut effect_delivered = ack;
+        let mut base_micros: Vec<(String, i64)> = Vec::new();
+        for mutation in &batch.mutations {
+            let base = store
+                .remote_document(&format!("{DOCUMENTS_PREFIX}/{}", mutation.path()))
+                .ok()
+                .flatten();
+            let micros = base.as_ref().map(Self::doc_micros).unwrap_or(0);
+            base_micros.push((mutation.path().to_string(), micros));
+            if micros < commit_micros {
+                effect_delivered = false;
+            }
+        }
+        let paths: Vec<String> = batch
+            .mutations
+            .iter()
+            .map(|mutation| mutation.path().to_string())
+            .collect();
+        self.last_settled = paths.clone();
+        if ack {
+            if engine.fold_acknowledgement(&batch, commit).is_ok() {
+                for mutation in &batch.mutations {
+                    let path = mutation.path();
+                    // A fold that leaves no base row (a delete,
+                    // a patch of an absent document) marks the
+                    // document absent as of the commit: older
+                    // watch deliveries must not resurrect it.
+                    let now_absent = store
+                        .remote_document(&format!("{DOCUMENTS_PREFIX}/{path}"))
+                        .map(|document| document.is_none())
+                        .unwrap_or(false);
+                    if now_absent {
+                        let inclusive = matches!(mutation, Mutation::Delete { .. });
+                        self.folded_absent
+                            .insert(path.to_string(), (commit_micros, inclusive));
+                    } else {
+                        self.folded_absent.remove(path);
+                    }
+                }
+                for (path, micros) in base_micros {
+                    if micros >= commit_micros {
+                        // The base already carried a watch
+                        // delivery at or beyond the commit: the
+                        // folded state is watch-confirmed.
+                        self.committed_unconfirmed.remove(&path);
+                    } else if self.delivered_docs.contains_key(&path) {
+                        // Folded into the base of a document the
+                        // listener currently sees: committed but
+                        // not yet watch-confirmed.
+                        self.committed_unconfirmed.insert(path, commit_micros);
+                    }
+                }
+                self.callback_acked.extend(paths);
+            }
+        } else if store.remove_batch(batch.id).is_ok() {
+            self.callback_rejected.extend(paths);
+        }
+        self.resolve_waiters();
+        effect_delivered
+    }
+
+    /// A document's update time in spec-model microseconds.
+    fn doc_micros(document: &Document) -> i64 {
+        document
+            .update_time
+            .as_ref()
+            .map(|time| time.seconds * 1_000_000 + (time.nanos / 1000) as i64)
+            .unwrap_or(0)
+    }
+
+    /// Records the current mutation flags of the last settled
+    /// batch's documents as delivered, without an event: an
+    /// acknowledgement whose effect the watch has not delivered
+    /// flips flags silently, and later events must not report
+    /// those flips as metadata changes.
+    fn absorb_settled_flags(&mut self) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        for path in self.last_settled.clone() {
+            if self.delivered_docs.contains_key(&path) {
+                let flags = (
+                    engine.has_pending(&path).unwrap_or(false),
+                    self.committed_unconfirmed.contains_key(&path),
+                );
+                self.delivered_flags.insert(path, flags);
+            }
+        }
+    }
+
+    fn register_waiter(&mut self) {
+        let through = self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.store().peek_batches(usize::MAX).ok())
+            .map(|batches| batches.iter().map(|batch| batch.id).max().unwrap_or(0))
+            .unwrap_or(0);
+        self.waiters.push((through, false));
+        self.resolve_waiters();
+    }
+
+    fn resolve_waiters(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let Ok(batches) = engine.store().peek_batches(usize::MAX) else {
+            return;
+        };
+        let queued: Vec<i64> = batches.iter().map(|batch| batch.id).collect();
+        for waiter in &mut self.waiters {
+            if !waiter.1 && !queued.iter().any(|id| *id <= waiter.0) {
+                waiter.1 = true;
+                self.resolved_waits += 1;
+            }
+        }
+    }
+}
+
+/// The document path a mutation targets.
+fn mutation_path(mutation: &Mutation) -> &str {
+    match mutation {
+        Mutation::Set { path, .. } | Mutation::Patch { path, .. } | Mutation::Delete { path } => {
+            path
+        }
+    }
+}
+
+/// Whether a spec value encodes a field transform
+/// (`{"_methodName": ...}`), which this crate does not model yet.
+fn contains_transform(value: &Json) -> bool {
+    match value {
+        Json::Object(map) => {
+            map.contains_key("_methodName") || map.values().any(contains_transform)
+        }
+        Json::Array(items) => items.iter().any(contains_transform),
+        _ => false,
     }
 }
 
@@ -471,16 +1116,47 @@ fn run_case(case: &Json) -> Outcome {
         None => return Outcome::Failed("case without steps".to_string()),
     };
     let mut harness = Harness::new();
+    harness.write_mode = steps.iter().any(|step| {
+        [
+            "userSet",
+            "userPatch",
+            "userDelete",
+            "writeAck",
+            "failWrite",
+            "waitForPendingWrites",
+        ]
+        .iter()
+        .any(|key| step.get(key).is_some())
+    });
+    if harness.write_mode {
+        harness.ensure_engine();
+    }
     for (index, step) in steps.iter().enumerate() {
         let at = |message: String| format!("step {index}: {message}");
         let mut emitted: Vec<Emitted> = Vec::new();
+        harness.resolved_waits = 0;
         for (key, value) in step.as_object().map(|o| o.iter()).into_iter().flatten() {
             match key.as_str() {
-                "expectedSnapshotEvents" | "expectedState" => {}
+                "expectedSnapshotEvents"
+                | "expectedState"
+                | "expectedWaitForPendingWritesEvents" => {}
                 "clientIndex" | "drainQueue" | "applyClientState" => {}
                 "enableNetwork" => {
                     let online = value.as_bool().unwrap_or(true);
-                    if !online && harness.online && harness.state.is_some() && !harness.unlistened {
+                    if harness.write_mode {
+                        harness.online = online;
+                        if online {
+                            // Resuming raises no event; the
+                            // fromCache flip is absorbed.
+                            harness.delivered_meta.0 = false;
+                        } else {
+                            harness.maybe_emit_composed(&mut emitted, false, false, true);
+                        }
+                    } else if !online
+                        && harness.online
+                        && harness.state.is_some()
+                        && !harness.unlistened
+                    {
                         // Going offline re-raises the current view
                         // (its fromCache flag flips); the documents
                         // and changes are unchanged.
@@ -523,6 +1199,7 @@ fn run_case(case: &Json) -> Outcome {
                         })
                         .collect();
                     harness.query = Some(query.clone());
+                    harness.query_path = query_path.clone();
                     let mut state = WatchState::new(target_id, query.effective_orders());
                     let fresh = !harness.resumable_targets.contains(&target_id);
                     if relisten {
@@ -545,14 +1222,38 @@ fn run_case(case: &Json) -> Outcome {
                     harness.target_id = target_id;
                     harness.unlistened = false;
                     harness.listen_saw_token = false;
+                    if harness.write_mode {
+                        // The new listener's view comes from the
+                        // store: seed it with what the client
+                        // already knows, and judge its events
+                        // against a fresh delivered view.
+                        let engine = harness.engine.clone().expect("write mode engine");
+                        for document in &seed {
+                            let _ = engine.store_remote_document(document);
+                            harness.store_remote_keys.insert(key_of(&document.name));
+                        }
+                        harness.synced = false;
+                        harness.pending_remote.clear();
+                        harness.delivered_docs.clear();
+                        harness.delivered_flags.clear();
+                        harness.delivered_valid = false;
+                        harness.delivered_meta = (false, false);
+                    }
                     if let Err(message) = harness.check_readd_token() {
                         return Outcome::Failed(at(message));
                     }
                     harness.current_query_sig =
                         serde_json::to_string(&query_json).unwrap_or_default();
-                    if harness
-                        .delivered_queries
-                        .contains(&harness.current_query_sig)
+                    let write_listen_event = harness.write_mode && {
+                        !harness.composed_view().is_empty()
+                            || harness
+                                .delivered_queries
+                                .contains(&harness.current_query_sig)
+                    };
+                    if write_listen_event
+                        || harness
+                            .delivered_queries
+                            .contains(&harness.current_query_sig)
                         || !seed.is_empty()
                     {
                         // A new listener immediately receives the
@@ -562,23 +1263,122 @@ fn run_case(case: &Json) -> Outcome {
                         // from the local store). Whether this fires
                         // depends only on harness state, never on
                         // what the step expects.
-                        let changes = seed
-                            .iter()
-                            .enumerate()
-                            .map(|(index, document)| DocumentChange {
-                                kind: DocumentChangeKind::Added,
-                                document: document.clone(),
-                                old_index: None,
-                                new_index: Some(index),
-                            })
-                            .collect();
-                        emitted.push(Emitted::Pseudo(Snapshot {
-                            documents: seed,
-                            changes,
-                            read_time: None,
-                        }));
+                        if harness.write_mode {
+                            harness.maybe_emit_composed(&mut emitted, true, true, true);
+                        } else {
+                            let changes = seed
+                                .iter()
+                                .enumerate()
+                                .map(|(index, document)| DocumentChange {
+                                    kind: DocumentChangeKind::Added,
+                                    document: document.clone(),
+                                    old_index: None,
+                                    new_index: Some(index),
+                                })
+                                .collect();
+                            emitted.push(Emitted::Pseudo(Snapshot {
+                                documents: seed,
+                                changes,
+                                read_time: None,
+                            }));
+                        }
                     }
                     harness.had_listen = true;
+                }
+                "changeUser" => {
+                    return Outcome::Skipped("user change not modeled".to_string());
+                }
+                "userSet" => {
+                    let args = value.as_array().cloned().unwrap_or_default();
+                    let path = args
+                        .first()
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let data = args.get(1).cloned().unwrap_or(Json::Null);
+                    if contains_transform(&data) {
+                        return Outcome::Skipped("field transforms not modeled".to_string());
+                    }
+                    harness.enqueue_spec(Mutation::Set {
+                        path,
+                        fields: json_fields(&data),
+                        merge_paths: None,
+                        exists: None,
+                    });
+                    harness.maybe_emit_composed(&mut emitted, false, false, true);
+                }
+                "userPatch" => {
+                    let args = value.as_array().cloned().unwrap_or_default();
+                    let path = args
+                        .first()
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let data = args.get(1).cloned().unwrap_or(Json::Null);
+                    if contains_transform(&data) {
+                        return Outcome::Skipped("field transforms not modeled".to_string());
+                    }
+                    let fields = json_fields(&data);
+                    let mask: Vec<String> = fields.keys().cloned().collect();
+                    harness.enqueue_spec(Mutation::Patch {
+                        path,
+                        fields,
+                        mask,
+                        exists: None,
+                    });
+                    harness.maybe_emit_composed(&mut emitted, false, false, true);
+                }
+                "userDelete" => {
+                    let path = match value {
+                        Json::String(path) => path.clone(),
+                        other => other
+                            .as_array()
+                            .and_then(|args| args.first())
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    };
+                    harness.enqueue_spec(Mutation::Delete { path });
+                    harness.maybe_emit_composed(&mut emitted, false, false, true);
+                }
+                "writeAck" => {
+                    let version = value.get("version").and_then(Json::as_i64).unwrap_or(0);
+                    let commit: Timestamp = ts_from_micros(version);
+                    // An acknowledgement raises an event only
+                    // when the watch had already delivered the
+                    // document (its pending flag was part of a
+                    // server-confirmed view); otherwise the flip
+                    // surfaces with the watch event that delivers
+                    // the document.
+                    let gate = harness.settle_oldest(true, commit);
+                    let before = emitted.len();
+                    harness.maybe_emit_composed(&mut emitted, false, false, gate);
+                    if emitted.len() == before {
+                        harness.absorb_settled_flags();
+                    }
+                }
+                "failWrite" => {
+                    let keep = value
+                        .get("keepInQueue")
+                        .and_then(Json::as_bool)
+                        .unwrap_or(false);
+                    let code = value
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(Json::as_i64)
+                        .unwrap_or(0);
+                    // Retryable errors (and explicit keepInQueue)
+                    // leave the batch queued for the write
+                    // stream's retry: nothing settles, nothing is
+                    // reported, the local view is unchanged.
+                    let retryable = matches!(code, 1 | 2 | 4 | 10 | 13 | 14 | 16);
+                    if !keep && !retryable {
+                        harness.settle_oldest(false, ts_from_micros(0));
+                        harness.maybe_emit_composed(&mut emitted, false, false, true);
+                    }
+                }
+                "waitForPendingWrites" => {
+                    harness.register_waiter();
                 }
                 "userUnlisten" => {
                     if harness.listen_saw_token {
@@ -951,10 +1751,25 @@ fn run_case(case: &Json) -> Outcome {
         } else {
             let unexpected = emitted
                 .iter()
-                .filter(|event| !matches!(event, Emitted::Pseudo(_)))
+                .filter(|event| {
+                    !matches!(event, Emitted::Pseudo(_))
+                        && !matches!(event, Emitted::Composed { initial: true, .. })
+                })
                 .count();
             if unexpected > 0 {
                 return Outcome::Failed(at(format!("{unexpected} unexpected snapshot event(s)")));
+            }
+        }
+
+        if let Some(expected_waits) = step
+            .get("expectedWaitForPendingWritesEvents")
+            .and_then(Json::as_i64)
+        {
+            if harness.resolved_waits != expected_waits as usize {
+                return Outcome::Failed(at(format!(
+                    "waitForPendingWrites resolutions: expected {expected_waits},                      got {}",
+                    harness.resolved_waits
+                )));
             }
         }
 
@@ -998,6 +1813,55 @@ fn run_case(case: &Json) -> Outcome {
                     }
                 }
             }
+            if harness.write_mode {
+                if let Some(callbacks) = expected_state.get("userCallbacks") {
+                    let expected_acked: BTreeSet<String> = callbacks
+                        .get("acknowledgedDocs")
+                        .and_then(Json::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Json::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    let expected_rejected: BTreeSet<String> = callbacks
+                        .get("rejectedDocs")
+                        .and_then(Json::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Json::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    if harness.callback_acked != expected_acked
+                        || harness.callback_rejected != expected_rejected
+                    {
+                        return Outcome::Failed(at(format!(
+                            "write callbacks: expected acked {expected_acked:?} / rejected                              {expected_rejected:?}, got acked {:?} / rejected {:?}",
+                            harness.callback_acked, harness.callback_rejected
+                        )));
+                    }
+                    harness.callback_acked.clear();
+                    harness.callback_rejected.clear();
+                }
+                if let Some(expected_count) = expected_state
+                    .get("numOutstandingWrites")
+                    .and_then(Json::as_i64)
+                {
+                    // The spec model's write stream pipelines at
+                    // most 10 batches in flight; further batches
+                    // wait in the queue and are not outstanding.
+                    let actual = harness
+                        .engine
+                        .as_ref()
+                        .and_then(|engine| engine.store().batch_count().ok())
+                        .map(|count| count.min(10))
+                        .unwrap_or(usize::MAX);
+                    if actual != expected_count as usize {
+                        return Outcome::Failed(at(format!(
+                            "numOutstandingWrites: expected {expected_count}, got {actual}"
+                        )));
+                    }
+                }
+            }
         }
     }
     Outcome::Passed
@@ -1031,13 +1895,42 @@ fn compare_events(
                 Emitted::Error(code) => {
                     return Err(format!("expected error {error_code}, got error {code}"));
                 }
-                Emitted::Snapshot(_) | Emitted::Pseudo(_) => {
+                Emitted::Snapshot(_) | Emitted::Pseudo(_) | Emitted::Composed { .. } => {
                     return Err(format!("expected error {error_code}, got a snapshot"));
                 }
             }
         }
+        let mut actual_metadata: Vec<String> = Vec::new();
         let snapshot = match actual {
             Emitted::Snapshot(snapshot) | Emitted::Pseudo(snapshot) => snapshot,
+            Emitted::Composed {
+                snapshot,
+                from_cache,
+                has_pending,
+                metadata,
+                ..
+            } => {
+                let expected_from_cache = expected
+                    .get("fromCache")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false);
+                let expected_pending = expected
+                    .get("hasPendingWrites")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false);
+                if from_cache != expected_from_cache {
+                    return Err(format!(
+                        "fromCache mismatch: expected {expected_from_cache}, got {from_cache}"
+                    ));
+                }
+                if has_pending != expected_pending {
+                    return Err(format!(
+                        "hasPendingWrites mismatch: expected {expected_pending},                          got {has_pending}"
+                    ));
+                }
+                actual_metadata = metadata.iter().map(|doc| key_of(&doc.name)).collect();
+                snapshot
+            }
             Emitted::Error(code) => {
                 return Err(format!("expected a snapshot, got error {code}"));
             }
@@ -1119,6 +2012,29 @@ fn compare_events(
                 ));
             }
         }
+        // Metadata-only changes (mutation state flips on
+        // unchanged documents), compared by document key.
+        let expected_metadata: Vec<String> = {
+            let mut keys: Vec<String> = expected
+                .get("metadata")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|doc| doc.get("key").and_then(Json::as_str))
+                .map(str::to_string)
+                .collect();
+            keys.sort();
+            keys
+        };
+        if !expected_metadata.is_empty() || !actual_metadata.is_empty() {
+            let mut actual_sorted = actual_metadata.clone();
+            actual_sorted.sort();
+            if actual_sorted != expected_metadata {
+                return Err(format!(
+                    "metadata mismatch: actual {actual_sorted:?},                      expected {expected_metadata:?}"
+                ));
+            }
+        }
     }
     if emitted.next().is_some() {
         return Err("more snapshot events emitted than expected".to_string());
@@ -1183,6 +2099,119 @@ fn relisten_event_generation_ignores_expectations() {
     assert!(matches!(run_case(&delivered), Outcome::Failed(_)));
 }
 
+/// Regression (PR #7 review): a watch confirmation whose
+/// fields are unchanged produces no `WatchEvent::Snapshot`
+/// from the watch state, but the delivery must still reach
+/// the store so the committed write clears. A set of the same
+/// value, acknowledged before the watch delivers its version:
+/// the final barrier raises a metadata-only event with
+/// `hasPendingWrites` false.
+#[test]
+fn unchanged_fields_confirmation_still_clears_pending() {
+    let query = serde_json::json!({
+        "path": "collection", "filters": [], "orderBys": []
+    });
+    let doc = |version: i64| {
+        serde_json::json!({
+            "key": "collection/a", "value": {"n": 1}, "version": version,
+            "createTime": 0,
+            "options": {"hasCommittedMutations": false, "hasLocalMutations": false}
+        })
+    };
+    let case = serde_json::json!({
+        "config": {"numClients": 1},
+        "steps": [
+            {"userListen": {"query": query, "targetId": 2},
+             "expectedState": {"activeTargets": {"2": {
+                "queries": [query], "resumeToken": ""}}}},
+            {"watchAck": [2]},
+            {"watchEntity": {"docs": [doc(1000)], "targets": [2]}},
+            {"watchCurrent": [[2], "resume-token-1000"]},
+            {"watchSnapshot": {"version": 1000, "targetIds": []},
+             "expectedSnapshotEvents": [{
+                "added": [doc(1000)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": false,
+                "query": query
+             }]},
+            {"userSet": ["collection/a", {"n": 1}],
+             "expectedSnapshotEvents": [{
+                "modified": [doc(0)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": true,
+                "query": query
+             }]},
+            {"writeAck": {"version": 2000},
+             "expectedState": {"userCallbacks": {
+                "acknowledgedDocs": ["collection/a"], "rejectedDocs": []}}},
+            {"watchEntity": {"docs": [doc(2000)], "targets": [2]}},
+            {"watchSnapshot": {"version": 2000, "targetIds": []},
+             "expectedSnapshotEvents": [{
+                "metadata": [doc(2000)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": false,
+                "query": query
+             }]},
+        ],
+    });
+    match run_case(&case) {
+        Outcome::Passed => {}
+        Outcome::Skipped(reason) => panic!("confirmation case skipped: {reason}"),
+        Outcome::Failed(message) => panic!("confirmation case failed: {message}"),
+    }
+}
+
+/// Regression (PR #7 review, second round): buffered streamed
+/// updates must not leak into the composed view before their
+/// consistent point. A remote change to A arrives without its
+/// barrier; a local set of B then raises a snapshot that still
+/// shows the old A. The barrier afterwards delivers A's change.
+#[test]
+fn streamed_updates_wait_for_the_consistent_point() {
+    let query = serde_json::json!({
+        "path": "collection", "filters": [], "orderBys": []
+    });
+    let doc = |key: &str, n: i64, version: i64| {
+        serde_json::json!({
+            "key": key, "value": {"n": n}, "version": version,
+            "createTime": 0,
+            "options": {"hasCommittedMutations": false, "hasLocalMutations": false}
+        })
+    };
+    let case = serde_json::json!({
+        "config": {"numClients": 1},
+        "steps": [
+            {"userListen": {"query": query, "targetId": 2},
+             "expectedState": {"activeTargets": {"2": {
+                "queries": [query], "resumeToken": ""}}}},
+            {"watchAck": [2]},
+            {"watchEntity": {"docs": [doc("collection/a", 1, 1000), doc("collection/b", 1, 1000)], "targets": [2]}},
+            {"watchCurrent": [[2], "resume-token-1000"]},
+            {"watchSnapshot": {"version": 1000, "targetIds": []},
+             "expectedSnapshotEvents": [{
+                "added": [doc("collection/a", 1, 1000), doc("collection/b", 1, 1000)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": false,
+                "query": query
+             }]},
+            {"watchEntity": {"docs": [doc("collection/a", 2, 2000)], "targets": [2]}},
+            {"userSet": ["collection/b", {"n": 2}],
+             "expectedSnapshotEvents": [{
+                "modified": [doc("collection/b", 2, 0)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": true,
+                "query": query
+             }]},
+            {"watchSnapshot": {"version": 2000, "targetIds": []},
+             "expectedSnapshotEvents": [{
+                "modified": [doc("collection/a", 2, 2000)],
+                "errorCode": 0, "fromCache": false, "hasPendingWrites": true,
+                "query": query
+             }]},
+        ],
+    });
+    match run_case(&case) {
+        Outcome::Passed => {}
+        Outcome::Skipped(reason) => panic!("buffering case skipped: {reason}"),
+        Outcome::Failed(message) => panic!("buffering case failed: {message}"),
+    }
+}
+
 /// Runs one suite, prints its coverage summary, and asserts
 /// every non-skipped case passes.
 fn assert_suite(file: &str, label: &str) {
@@ -1219,6 +2248,11 @@ fn assert_suite(file: &str, label: &str) {
 #[test]
 fn listen_spec_suite() {
     assert_suite("listen_spec_test.json", "listen");
+}
+
+#[test]
+fn write_spec_suite() {
+    assert_suite("write_spec_test.json", "write");
 }
 
 #[test]
