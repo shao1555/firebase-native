@@ -176,7 +176,11 @@ impl PersistenceEngine {
                     // if it fails, retry the *local* commit — the
                     // batch is never resent.
                     loop {
-                        match self.fold_acknowledgement(&batch, commit_time) {
+                        match self.fold_acknowledgement_with_results(
+                            &batch,
+                            commit_time,
+                            &ack.transform_results,
+                        ) {
                             Ok(()) => break,
                             Err(_) => {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -210,10 +214,25 @@ impl PersistenceEngine {
     /// state: computes each touched document's post-ack state and
     /// commits it together with the queue removal as one store
     /// transaction.
+    /// The fold for batches without transform results.
+    #[allow(dead_code)]
     pub(crate) fn fold_acknowledgement(
         &self,
         batch: &crate::store::MutationBatch,
         commit_time: crate::value::Timestamp,
+    ) -> Result<()> {
+        self.fold_acknowledgement_with_results(batch, commit_time, &[])
+    }
+
+    /// The fold with the server's per-write transform results
+    /// (aligned with the batch's mutations): each mutation's
+    /// transformed fields take the server's exact results
+    /// instead of the locally computed values.
+    pub(crate) fn fold_acknowledgement_with_results(
+        &self,
+        batch: &crate::store::MutationBatch,
+        commit_time: crate::value::Timestamp,
+        transform_results: &[Vec<crate::value::Value>],
     ) -> Result<()> {
         let mut updates: Vec<(String, Option<Document>)> = Vec::new();
         for mutation in &batch.mutations {
@@ -233,7 +252,15 @@ impl PersistenceEngine {
                     }
                 }
             }
-            let mut next = mutation.apply_to_remote(current, commit_time);
+            let results = transform_results
+                .get(updates.len())
+                .map(|results| results.as_slice());
+            let mut next = match results {
+                Some(results) if !results.is_empty() => {
+                    mutation.apply_to_remote_with_results(current, commit_time, results)
+                }
+                _ => mutation.apply_to_remote(current, commit_time),
+            };
             if let Some(document) = next.as_mut() {
                 // A newly created document has no name yet (the
                 // mutation model works with relative paths): assign
@@ -410,6 +437,7 @@ mod tests {
             fields,
             merge_paths: None,
             exists: None,
+            transforms: Vec::new(),
         }
     }
 
@@ -572,6 +600,7 @@ mod tests {
                 },
                 mask: vec!["n".to_string()],
                 exists: Some(true),
+                transforms: Vec::new(),
             }])
             .unwrap();
         let view = engine.local_document("notes/a").unwrap().unwrap();

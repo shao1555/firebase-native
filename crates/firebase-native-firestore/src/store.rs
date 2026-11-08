@@ -376,6 +376,7 @@ mod tests {
             fields,
             merge_paths: None,
             exists: None,
+            transforms: Vec::new(),
         }]
     }
 
@@ -424,6 +425,7 @@ mod tests {
                 fields,
                 merge_paths: None,
                 exists: None,
+                transforms: Vec::new(),
             }])
             .unwrap();
         let batches = store.peek_batches(10).unwrap();

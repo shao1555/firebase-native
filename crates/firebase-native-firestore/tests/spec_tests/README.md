@@ -50,8 +50,8 @@ layers, so the runner covers the **watch layer** today:
   as **skipped with a reason**, never silently passed: multiple
   clients/tabs (including primary election), multiple
   concurrent targets, query limits, bloom existence filters
-  and mismatch limbo resolution, snapshots-in-sync listeners,
-  and field transforms.
+  and mismatch limbo resolution, and snapshots-in-sync
+  listeners.
 
 Current results: **listen** (66 cases) 29 passed / 37 skipped /
 0 failed — skips are multi-client / multi-tab scenarios,
@@ -62,9 +62,21 @@ the skips are all multi-client primary-lease scenarios; the
 single-client cases cover persisted mutations re-sent after
 restart, per-user mutation queues across uid switches and
 restarts, persisted mutations visible to listeners, and
-persisted remote documents. **Write** (59 cases) 39 passed /
-20 skipped / 0 failed — skips are multi-client scenarios (18)
-and field transforms (2).
+persisted remote documents. **Write** (59 cases) 41 passed /
+18 skipped / 0 failed — the skips are all multi-client
+scenarios. Field transforms are modeled end to end: the
+mutation model carries transforms (increment, server
+timestamp, array union/remove), the wire form emits them as
+`update_transforms`, and the acknowledgement fold installs
+the server's transform results (carried on the Write
+stream's committed-batch acknowledgement). Decimal128
+values — the reference core's exact decimal number kind,
+held here as canonical strings — lose precision through
+`f64` in local increments and recover exactly from the
+transform result, as the two Decimal128 cases pin down: a
+queued transform's transformed fields show the estimate
+computed at enqueue time, over any base movement and past
+the fold, until the watch confirms the write.
 **Recovery** (25 cases) 15 passed / 10 skipped / 0 failed —
 the skips are multi-client scenarios (7), limbo documents (2)
 and multiple concurrent targets (1). `failDatabase` arms

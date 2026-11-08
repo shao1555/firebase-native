@@ -172,6 +172,39 @@ pub enum Value {
     Array(Vec<Value>),
     /// A map of string keys to values.
     Map(Fields),
+    /// A 128-bit decimal number, held as its canonical string
+    /// form so no precision is lost. This mirrors the reference
+    /// core's decimal number kind: it arises from increment
+    /// transform operands and server transform results, where
+    /// exact decimal precision matters beyond what `Double`
+    /// holds. It has no distinct wire type — on the wire it is
+    /// sent as its `Double` approximation, and values read from
+    /// the server are never decimals. Local arithmetic on a
+    /// decimal goes through `Double`, losing precision exactly
+    /// as the reference core's local increment does; the exact
+    /// value is restored from the server's transform result
+    /// when the write is acknowledged.
+    Decimal128(String),
+}
+
+impl Value {
+    /// The `f64` approximation of a numeric value, if it is one.
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Integer(v) => Some(*v as f64),
+            Value::Double(v) => Some(*v),
+            Value::Decimal128(v) => v.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Whether this value is one of the numeric kinds.
+    pub(crate) fn is_number(&self) -> bool {
+        matches!(
+            self,
+            Value::Integer(_) | Value::Double(_) | Value::Decimal128(_)
+        )
+    }
 }
 
 impl Value {
@@ -190,6 +223,7 @@ impl Value {
                 longitude: point.longitude,
             }),
             Value::Reference(name) => ValueType::ReferenceValue(name.clone()),
+            Value::Decimal128(v) => ValueType::DoubleValue(v.parse().unwrap_or(f64::NAN)),
             Value::Array(values) => {
                 ValueType::ArrayValue(crate::google::firestore::v1::ArrayValue {
                     values: values.iter().map(Value::to_proto).collect(),
@@ -256,7 +290,7 @@ impl Value {
         let rank = |value: &Value| match value {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::Integer(_) | Value::Double(_) => 2,
+            Value::Integer(_) | Value::Double(_) | Value::Decimal128(_) => 2,
             Value::Timestamp(_) => 3,
             Value::String(_) => 4,
             Value::Bytes(_) => 5,
@@ -269,12 +303,13 @@ impl Value {
             Equal => {}
             ordering => return ordering,
         }
+        // Numbers compare numerically across all three kinds,
+        // exactly (see `compare_numbers`).
+        if self.is_number() {
+            return compare_numbers(self, other);
+        }
         match (self, other) {
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Double(a), Value::Double(b)) => compare_doubles(*a, *b),
-            (Value::Integer(a), Value::Double(b)) => compare_int_double(*a, *b),
-            (Value::Double(a), Value::Integer(b)) => compare_int_double(*b, *a).reverse(),
             (Value::Timestamp(a), Value::Timestamp(b)) => {
                 a.seconds.cmp(&b.seconds).then(a.nanos.cmp(&b.nanos))
             }
@@ -332,36 +367,233 @@ fn compare_doubles(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
-/// Compares an integer with a double numerically. When the double is
-/// integral and in `i64` range the comparison is exact; otherwise the
-/// double's fractional part (or its magnitude beyond `i64`) decides.
-fn compare_int_double(int: i64, double: f64) -> std::cmp::Ordering {
+/// Compares two numbers exactly, across the integer, double
+/// and decimal kinds. `NaN` sorts before every other number
+/// (Firestore semantics); infinities sort beyond every finite
+/// value. Finite values are compared through their exact
+/// decimal forms, so two decimals that round to the same `f64`
+/// still order by their true value, and a decimal compares
+/// against an integer or a double by the double's exact binary
+/// value — never by a rounded approximation.
+fn compare_numbers(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
-    if double.is_nan() {
-        return Greater; // NaN sorts before all numbers.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Class {
+        Nan,
+        NegInf,
+        Finite,
+        PosInf,
     }
-    if double >= 9_223_372_036_854_775_808.0 {
-        return Less; // 2^63: beyond every i64.
-    }
-    if double < -9_223_372_036_854_775_808.0 {
-        return Greater;
-    }
-    let truncated = double.trunc();
-    let as_int = truncated as i64;
-    match int.cmp(&as_int) {
-        Equal => {
-            // Same integral part: a positive fraction makes the
-            // double larger, a negative fraction smaller.
-            let fraction = double - truncated;
-            if fraction > 0.0 {
-                Less
-            } else if fraction < 0.0 {
-                Greater
+    let class = |value: &Value| match value {
+        Value::Double(double) => {
+            if double.is_nan() {
+                Class::Nan
+            } else if *double == f64::INFINITY {
+                Class::PosInf
+            } else if *double == f64::NEG_INFINITY {
+                Class::NegInf
             } else {
-                Equal
+                Class::Finite
             }
         }
-        ordering => ordering,
+        Value::Decimal128(text) => {
+            let lower = text.trim().to_ascii_lowercase();
+            if lower.contains("nan") {
+                Class::Nan
+            } else if lower.contains("inf") {
+                if lower.starts_with('-') {
+                    Class::NegInf
+                } else {
+                    Class::PosInf
+                }
+            } else {
+                Class::Finite
+            }
+        }
+        _ => Class::Finite,
+    };
+    match (class(a), class(b)) {
+        (Class::Nan, Class::Nan) => return Equal,
+        (Class::Nan, _) => return Less,
+        (_, Class::Nan) => return Greater,
+        (Class::PosInf, Class::PosInf) | (Class::NegInf, Class::NegInf) => return Equal,
+        (Class::PosInf, _) | (_, Class::NegInf) => return Greater,
+        (Class::NegInf, _) | (_, Class::PosInf) => return Less,
+        (Class::Finite, Class::Finite) => {}
+    }
+    match (ExactDecimal::of(a), ExactDecimal::of(b)) {
+        (Some(left), Some(right)) => left.compare(&right),
+        // A decimal string the exact parser cannot read: keep
+        // the historical `f64` ordering rather than failing.
+        _ => compare_doubles(
+            a.as_f64().unwrap_or(f64::NAN),
+            b.as_f64().unwrap_or(f64::NAN),
+        ),
+    }
+}
+
+/// An exact decimal number: `(-1 if negative) * digits *
+/// 10^exponent`, where `digits` is a decimal integer string
+/// with no leading zeros (`"0"` for zero). Two values in this
+/// form compare by adjusted exponent, then digit by digit.
+struct ExactDecimal {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+impl ExactDecimal {
+    fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Integer(int) => Some(Self {
+                negative: *int < 0,
+                digits: int.unsigned_abs().to_string(),
+                exponent: 0,
+            }),
+            Value::Double(double) => Self::from_f64(*double),
+            Value::Decimal128(text) => Self::parse(text),
+            _ => None,
+        }
+    }
+
+    /// Parses a decimal string (`[sign] digits [. digits]
+    /// [(e|E) [sign] digits]`).
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (negative, rest) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        };
+        let (mantissa, exp) = match rest.find(['e', 'E']) {
+            Some(index) => (&rest[..index], rest[index + 1..].parse::<i64>().ok()?),
+            None => (rest, 0),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((int, frac)) => (int, frac),
+            None => (mantissa, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|byte| byte.is_ascii_digit())
+            || !frac_part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let digits = format!("{int_part}{frac_part}");
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return Some(Self {
+                negative: false,
+                digits: "0".to_string(),
+                exponent: 0,
+            });
+        }
+        Some(Self {
+            negative,
+            digits: digits.to_string(),
+            exponent: exp - frac_part.len() as i64,
+        })
+    }
+
+    /// The exact decimal form of a finite `f64`: every binary
+    /// float is `mantissa * 2^e2`, which has a finite decimal
+    /// expansion (`mantissa * 5^(-e2)` shifted by `10^e2` when
+    /// `e2` is negative).
+    fn from_f64(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value == 0.0 {
+            return Some(Self {
+                negative: false,
+                digits: "0".to_string(),
+                exponent: 0,
+            });
+        }
+        let bits = value.to_bits();
+        let biased = ((bits >> 52) & 0x7ff) as i64;
+        let fraction = bits & ((1u64 << 52) - 1);
+        let (mantissa, e2) = if biased == 0 {
+            (fraction, -1074) // Subnormal: no implicit leading bit.
+        } else {
+            (fraction | (1u64 << 52), biased - 1075)
+        };
+        // Decimal digits of the mantissa, least significant first.
+        let mut digits: Vec<u8> = Vec::new();
+        let mut rest = mantissa;
+        while rest > 0 {
+            digits.push((rest % 10) as u8);
+            rest /= 10;
+        }
+        let multiply = |digits: &mut Vec<u8>, factor: u8| {
+            let mut carry = 0u8;
+            for digit in digits.iter_mut() {
+                let product = *digit * factor + carry;
+                *digit = product % 10;
+                carry = product / 10;
+            }
+            while carry > 0 {
+                digits.push(carry % 10);
+                carry /= 10;
+            }
+        };
+        let mut exponent = 0i64;
+        if e2 >= 0 {
+            for _ in 0..e2 {
+                multiply(&mut digits, 2);
+            }
+        } else {
+            for _ in 0..-e2 {
+                multiply(&mut digits, 5);
+            }
+            exponent = e2;
+        }
+        let digits: String = digits
+            .iter()
+            .rev()
+            .map(|digit| (b'0' + digit) as char)
+            .collect();
+        Some(Self {
+            negative: bits >> 63 != 0,
+            digits,
+            exponent,
+        })
+    }
+
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        match (self.digits == "0", other.digits == "0") {
+            (true, true) => return Equal,
+            (true, false) => return if other.negative { Greater } else { Less },
+            (false, true) => return if self.negative { Less } else { Greater },
+            (false, false) => {}
+        }
+        if self.negative != other.negative {
+            return if self.negative { Less } else { Greater };
+        }
+        // Magnitude: the adjusted exponent (position of the
+        // leading digit) decides first, then the digit strings
+        // with the shorter one reading as zero-padded.
+        let magnitude = (self.exponent + self.digits.len() as i64)
+            .cmp(&(other.exponent + other.digits.len() as i64))
+            .then_with(|| {
+                let (left, right) = (self.digits.as_bytes(), other.digits.as_bytes());
+                for index in 0..left.len().max(right.len()) {
+                    let x = left.get(index).copied().unwrap_or(b'0');
+                    let y = right.get(index).copied().unwrap_or(b'0');
+                    match x.cmp(&y) {
+                        Equal => continue,
+                        ordering => return ordering,
+                    }
+                }
+                Equal
+            });
+        if self.negative {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
     }
 }
 
@@ -603,6 +835,48 @@ mod tests {
             Less
         );
         assert_eq!(Value::Double(-0.0).compare(&Value::Integer(0)), Equal);
+    }
+
+    #[test]
+    fn ordering_decimals_exact() {
+        use std::cmp::Ordering::*;
+        let decimal = |text: &str| Value::Decimal128(text.to_string());
+        // Decimals that round to the same f64 still order by
+        // their true value, not lexicographically.
+        let close_low = decimal("9.999999999999999999999999999999999");
+        let close_high = decimal("10.00000000000000000000000000000001");
+        assert_eq!(close_low.compare(&close_high), Less);
+        assert_eq!(close_high.compare(&close_low), Greater);
+        // Mixed comparisons agree: the exact value of the
+        // double 10.0 is 10, between the two decimals.
+        assert_eq!(close_low.compare(&Value::Double(10.0)), Less);
+        assert_eq!(close_high.compare(&Value::Double(10.0)), Greater);
+        assert_eq!(Value::Double(10.0).compare(&close_low), Greater);
+        // Precision an f64 cannot represent: 2^53 + 1.
+        assert_eq!(
+            decimal("9007199254740993").compare(&Value::Integer(9007199254740993)),
+            Equal
+        );
+        assert_eq!(
+            decimal("9007199254740993").compare(&Value::Double(9007199254740992.0)),
+            Greater
+        );
+        // The exact value of the double 0.1 is slightly above
+        // the decimal 0.1.
+        assert_eq!(decimal("0.1").compare(&Value::Double(0.1)), Less);
+        // Numerically equal forms are Equal, whatever the
+        // spelling; exponent forms parse too.
+        assert_eq!(decimal("1.0").compare(&decimal("1.00")), Equal);
+        assert_eq!(decimal("1E+2").compare(&Value::Integer(100)), Equal);
+        assert_eq!(decimal("5e-1").compare(&Value::Double(0.5)), Equal);
+        assert_eq!(decimal("-0.0").compare(&Value::Integer(0)), Equal);
+        // Negatives order by reversed magnitude.
+        assert_eq!(decimal("-2.5").compare(&decimal("-2.4")), Less);
+        assert_eq!(decimal("-2.5").compare(&Value::Double(-2.4)), Less);
+        // Decimal NaN sorts before every other number, like
+        // double NaN.
+        assert_eq!(decimal("NaN").compare(&Value::Integer(i64::MIN)), Less);
+        assert_eq!(decimal("NaN").compare(&Value::Double(f64::NAN)), Equal);
     }
 
     #[test]

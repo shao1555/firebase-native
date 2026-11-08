@@ -39,6 +39,24 @@ use crate::google::firestore::v1::{Write, WriteRequest, WriteResponse};
 use crate::listen::Backoff;
 use crate::value::Timestamp;
 
+/// Extracts per-write transform results from a commit
+/// response, converting each to the public value model.
+fn transform_results_of(
+    results: &[crate::google::firestore::v1::WriteResult],
+) -> Vec<Vec<crate::value::Value>> {
+    results
+        .iter()
+        .map(|result| {
+            result
+                .transform_results
+                .iter()
+                .map(|value| crate::value::Value::from_proto(value.clone()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// The acknowledgement of one committed batch.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CommittedBatch {
@@ -47,6 +65,10 @@ pub(crate) struct CommittedBatch {
     /// Per-write update times, in request order (`None` for
     /// deletes, which report no update time).
     pub(crate) update_times: Vec<Option<Timestamp>>,
+    /// Per-write transform results, in request order: the
+    /// server-computed values of each write's transformed
+    /// fields, in transform order.
+    pub(crate) transform_results: Vec<Vec<crate::value::Value>>,
 }
 
 /// What a response means for the protocol.
@@ -154,6 +176,7 @@ impl WriteProtocol {
                     response.write_results.len()
                 )));
             }
+            let transform_results = transform_results_of(&response.write_results);
             return Ok(WriteOutcome::ReplayedAck(CommittedBatch {
                 commit_time: response.commit_time.map(Timestamp::from),
                 update_times: response
@@ -161,6 +184,7 @@ impl WriteProtocol {
                     .into_iter()
                     .map(|result| result.update_time.map(Timestamp::from))
                     .collect(),
+                transform_results,
             }));
         }
         if !self.handshaken {
@@ -176,6 +200,7 @@ impl WriteProtocol {
                 response.write_results.len()
             )));
         }
+        let transform_results = transform_results_of(&response.write_results);
         Ok(WriteOutcome::BatchAck(CommittedBatch {
             commit_time: response.commit_time.map(Timestamp::from),
             update_times: response
@@ -183,6 +208,7 @@ impl WriteProtocol {
                 .into_iter()
                 .map(|result| result.update_time.map(Timestamp::from))
                 .collect(),
+            transform_results,
         }))
     }
 
