@@ -44,13 +44,37 @@ layers, so the runner covers the **watch layer** today:
   query limits, existence filters, snapshots-in-sync listeners,
   and restart/shutdown/primary-election behavior.
 
-Current results (listen suite, 66 cases): **20 passed, 46
-skipped, 0 failed**. Skip reasons break down as: multi-client /
-multi-tab scenarios (28), local mutations (7),
-snapshots-in-sync listeners (4), restart (3), multiple
-concurrent targets (3), query limit (1).
+Current results: **listen** (66 cases) 20 passed / 46 skipped /
+0 failed — skips are multi-client / multi-tab scenarios (28),
+local mutations (7), snapshots-in-sync listeners (4), restart
+(3), multiple concurrent targets (3), query limit (1).
+**Resume token** (2 cases) 2 passed / 0 skipped. **Existence
+filter** (26 cases) 2 passed / 24 skipped / 0 failed: the
+matching-count cases pass through `WatchState`'s filter
+handling, while bloom-filter cases and count mismatches are
+skipped — resolving either needs the sync engine's limbo /
+target re-run orchestration (the reference client verifies
+possibly-deleted documents on a separate limbo target before
+removing them), which this crate does not have yet. In the real
+protocol a mismatch restarts the watch without its resume
+token, which `WatchState` already signals; the spec harness's
+stepwise limbo resolution is what is not modeled.
 
-Driving the remaining suites (existence filter and resume token
-first — they exercise `WatchState` directly), the write suite
-against the persistence engine, and store-backed watches are
-follow-up work, as is comparing snapshot metadata.
+Two verification properties are worth noting. Resume tokens are
+held per target, synced from the watch state after every
+response, restored into new listens, and compared exactly
+against `expectedState.activeTargets[*].resumeToken`; at each
+(re)add the harness also builds the request through the
+driver's real `add_target_request` and checks the token it
+would send. And whether an existence filter is a supported
+matching-count case is decided from the harness's own view
+(emitted documents plus the pending overlay), independently of
+the implementation's restart signal — a restart on a matching
+filter *fails* the case. Both properties were validated by
+fault injection: making `WatchState` discard received tokens
+fails both resume-token cases, and making it restart on every
+filter fails both matching-count cases (skips unchanged).
+
+Driving the write suite against the persistence engine and
+store-backed watches (which is where a limbo layer would live)
+are follow-up work, as is comparing snapshot metadata.

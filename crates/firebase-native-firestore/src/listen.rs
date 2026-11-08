@@ -180,6 +180,27 @@ impl WatchState {
         self.resume_token.as_deref()
     }
 
+    /// Records a resume token carried by a target change the
+    /// caller handles as bookkeeping; `on_response` does the
+    /// same for full responses. Used by the spec-test harness
+    /// for targeted snapshots it does not feed.
+    #[allow(dead_code)]
+    pub(crate) fn note_resume_token(&mut self, token: &[u8]) {
+        if !token.is_empty() {
+            self.resume_token = Some(token.to_vec());
+        }
+    }
+
+    /// Restores a resume token persisted for this target (the
+    /// local store's targets table) into a fresh state, for a
+    /// watch created on a previously watched query. Staged for
+    /// store-backed watches; exercised today by the spec-test
+    /// harness.
+    #[allow(dead_code)]
+    pub(crate) fn restore_resume_token(&mut self, token: Vec<u8>) {
+        self.resume_token = Some(token);
+    }
+
     fn applies_to_me(&self, target_ids: &[i32]) -> bool {
         target_ids.is_empty() || target_ids.contains(&self.target_id)
     }
@@ -780,7 +801,7 @@ pub(crate) fn is_transient_token_error(error: &Error) -> bool {
 /// Builds the `AddTarget` request that opens a stream. The current
 /// resume token is included when `resume` is set (it is not after a
 /// view reset, where the server must resend everything).
-fn add_target_request(
+pub(crate) fn add_target_request(
     database: &str,
     target: &Target,
     state: &WatchState,
