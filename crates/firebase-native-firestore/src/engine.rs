@@ -34,6 +34,10 @@ pub(crate) struct PersistenceEngine {
     pump_started: AtomicBool,
     /// Signalled whenever the queue changes (enqueue, ack, drop).
     queue_changed: Notify,
+    /// Signalled whenever the local view may have changed (any
+    /// generation bump). Store-backed watches wait on this as a
+    /// wakeup hint and re-derive the view from the generation.
+    view_changed: Notify,
     /// A monotone counter bumped on every local-state change
     /// (enqueue, acknowledgement fold, cache store). Readers that
     /// go online capture it before the fetch and compare after:
@@ -63,15 +67,15 @@ impl PersistenceEngine {
             documents_prefix,
             pump_started: AtomicBool::new(false),
             queue_changed: Notify::new(),
+            view_changed: Notify::new(),
             generation: AtomicU64::new(0),
             document_generations: Mutex::new(std::collections::HashMap::new()),
             dropped_error: Mutex::new(None),
         }
     }
 
-    /// The underlying store (the sync layer writes listen results
-    /// into it as the engine grows).
-    #[allow(dead_code)]
+    /// The underlying store (the sync layer reads and writes
+    /// target state through it).
     pub(crate) fn store(&self) -> &LocalStore {
         &self.store
     }
@@ -81,8 +85,25 @@ impl PersistenceEngine {
         self.generation.load(Ordering::SeqCst)
     }
 
+    /// The relative path of a full resource name in this
+    /// engine's database, if it belongs to it.
+    pub(crate) fn relative_path_of<'a>(&self, full_name: &'a str) -> Option<&'a str> {
+        full_name
+            .strip_prefix(&self.documents_prefix)?
+            .strip_prefix('/')
+    }
+
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.view_changed.notify_waiters();
+    }
+
+    /// A future that completes on the next local-view change.
+    /// Register it (pin + enable) *before* reading the view, the
+    /// same discipline as the pump's queue wait; the generation
+    /// remains the source of truth for whether anything changed.
+    pub(crate) fn view_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.view_changed.notified()
     }
 
     /// The per-document generation for a relative path (0 when
@@ -416,9 +437,15 @@ impl PersistenceEngine {
     /// Records that the server has no such document.
     pub(crate) fn store_remote_absent(&self, relative_path: &str) -> Result<()> {
         let name = full_document_name(&self.documents_prefix, relative_path);
-        self.store.remove_remote_document(&name)?;
+        self.store_remote_absent_name(&name)
+    }
+
+    /// Records that the server has no document with this full
+    /// resource name (the form watch deliveries arrive in).
+    pub(crate) fn store_remote_absent_name(&self, full_name: &str) -> Result<()> {
+        self.store.remove_remote_document(full_name)?;
         self.bump_generation();
-        self.bump_document(&name);
+        self.bump_document(full_name);
         Ok(())
     }
 

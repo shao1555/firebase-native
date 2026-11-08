@@ -113,7 +113,7 @@ async fn main() -> ExitCode {
 
         // 1. Create locally; the local view answers before any ack.
         let mut fields = Fields::new();
-        fields.insert("spaceId".to_string(), Value::String(space_id));
+        fields.insert("spaceId".to_string(), Value::String(space_id.clone()));
         fields.insert(
             "title".to_string(),
             Value::String("firebase-native P2 persistence check".to_string()),
@@ -204,6 +204,78 @@ async fn main() -> ExitCode {
         if server.is_some() {
             return Err("document still present after delete".to_string());
         }
+
+        // 5. Store-backed watch: recreate the document, watch it
+        // through the persistent client, and confirm a local
+        // update shows up in a snapshot (latency compensation
+        // delivers it from the queued write; the stream echo
+        // would too). The first snapshot is the cache snapshot.
+        let mut fields = Fields::new();
+        fields.insert("spaceId".to_string(), Value::String(space_id.clone()));
+        fields.insert(
+            "content".to_string(),
+            Value::String("watched document".to_string()),
+        );
+        persistent
+            .create_document("notes", Some(&doc_id), fields)
+            .await
+            .map_err(|err| format!("watch setup create failed: {err}"))?;
+        persistent
+            .wait_for_pending_writes()
+            .await
+            .map_err(|err| format!("watch setup wait failed: {err}"))?;
+        let mut listener = persistent
+            .watch_document(&path)
+            .await
+            .map_err(|err| format!("watch failed: {err}"))?;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), listener.next())
+            .await
+            .map_err(|_| "timed out waiting for the cache snapshot".to_string())?
+            .ok_or("watch ended before the cache snapshot")?
+            .map_err(|err| format!("cache snapshot failed: {err}"))?;
+        println!("cache snapshot: {} document(s)", first.documents.len());
+        if first.documents.len() != 1 {
+            return Err("cache snapshot does not hold the watched document".to_string());
+        }
+        let mut update = Fields::new();
+        update.insert("spaceId".to_string(), Value::String(space_id.clone()));
+        update.insert(
+            "content".to_string(),
+            Value::String("updated while watched".to_string()),
+        );
+        persistent
+            .set_document(&path, update)
+            .await
+            .map_err(|err| format!("watched set failed: {err}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw_update = false;
+        while std::time::Instant::now() < deadline && !saw_update {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await {
+                Ok(Some(Ok(snapshot))) => {
+                    saw_update = snapshot.documents.iter().any(|document| {
+                        document.fields.get("content")
+                            == Some(&Value::String("updated while watched".to_string()))
+                    });
+                }
+                Ok(Some(Err(err))) => return Err(format!("watch snapshot failed: {err}")),
+                Ok(None) => return Err("watch ended before the update snapshot".to_string()),
+                Err(_) => {}
+            }
+        }
+        if !saw_update {
+            return Err("no snapshot showed the local update".to_string());
+        }
+        println!("watch snapshot with the local update: received");
+        drop(listener);
+        persistent
+            .delete_document(&path)
+            .await
+            .map_err(|err| format!("watch cleanup delete failed: {err}"))?;
+        persistent
+            .wait_for_pending_writes()
+            .await
+            .map_err(|err| format!("watch cleanup wait failed: {err}"))?;
+        println!("WATCH LIVE CHECK PASSED");
         println!("PERSIST LIVE CHECK PASSED");
         Ok::<(), String>(())
     };

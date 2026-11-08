@@ -211,6 +211,14 @@ impl Firestore {
     /// exponential backoff when it breaks; terminal failures
     /// (permission denied, invalid target, ...) are delivered as one
     /// final `Err` item.
+    ///
+    /// With local persistence enabled the watch is store-backed:
+    /// the first snapshot comes from the local store immediately,
+    /// later snapshots are composed from the store (so local
+    /// writes appear as soon as they are queued), streamed
+    /// changes are written into the store, and the target resumes
+    /// with the resume token persisted by an earlier watch of the
+    /// same query.
     pub async fn watch_query(
         &self,
         parent_path: &str,
@@ -241,6 +249,16 @@ impl Firestore {
             ),
             resume_type: None,
         };
+        let store_watch = self.engine.as_ref().map(|engine| {
+            crate::listen::StoreWatch::new(
+                engine.clone(),
+                crate::listen::WatchSource::Query {
+                    parent_relative: parent_path.to_string(),
+                    query: query.clone(),
+                },
+                target_key(&target),
+            )
+        });
         let channel = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
@@ -248,6 +266,7 @@ impl Firestore {
             self.tokens.clone(),
             target,
             orders,
+            store_watch,
         ))
     }
 
@@ -268,6 +287,15 @@ impl Firestore {
             )),
             resume_type: None,
         };
+        let store_watch = self.engine.as_ref().map(|engine| {
+            crate::listen::StoreWatch::new(
+                engine.clone(),
+                crate::listen::WatchSource::Document {
+                    relative_path: path.to_string(),
+                },
+                target_key(&target),
+            )
+        });
         let channel = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
@@ -275,6 +303,7 @@ impl Firestore {
             self.tokens.clone(),
             target,
             Vec::new(),
+            store_watch,
         ))
     }
 
@@ -674,6 +703,19 @@ impl Firestore {
         }
         Ok(documents)
     }
+}
+
+/// A stable key for a watch target's row in the local store's
+/// targets table, derived from the target definition. Every
+/// watch uses the same wire target ID, so the row cannot be
+/// keyed by it; a hash of the definition keeps concurrent
+/// watches on different targets apart and lets the same target
+/// find its row in a later process.
+fn target_key(target: &crate::google::firestore::v1::Target) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{target:?}").hash(&mut hasher);
+    hasher.finish() as i64
 }
 
 /// Maps a gRPC status onto the shared error type.
