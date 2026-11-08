@@ -371,6 +371,7 @@ impl Firestore {
                     fields,
                     merge_paths: None,
                     exists: Some(false),
+                    transforms: Vec::new(),
                 },
                 &path,
             );
@@ -425,6 +426,7 @@ impl Firestore {
                     fields,
                     merge_paths: Some(mask),
                     exists: None,
+                    transforms: Vec::new(),
                 },
                 path,
             );
@@ -471,6 +473,7 @@ impl Firestore {
                     fields,
                     mask: field_mask.to_vec(),
                     exists: Some(true),
+                    transforms: Vec::new(),
                 },
                 path,
             );

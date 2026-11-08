@@ -79,12 +79,136 @@ fn json_to_value(json: &Json) -> Value {
         },
         Json::String(value) => Value::String(value.clone()),
         Json::Array(items) => Value::Array(items.iter().map(json_to_value).collect()),
-        Json::Object(map) => Value::Map(
-            map.iter()
-                .map(|(key, value)| (key.clone(), json_to_value(value)))
-                .collect(),
-        ),
+        Json::Object(map) => {
+            // The spec encoding of a Decimal128 value: a map
+            // whose only field carries the canonical string.
+            if map.len() == 1 {
+                if let Some(wrapper) = map.get("__decimal128__") {
+                    if let Some(string) = wrapper.get("stringValue").and_then(Json::as_str) {
+                        return Value::Decimal128(string.to_string());
+                    }
+                }
+            }
+            Value::Map(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), json_to_value(value)))
+                    .collect(),
+            )
+        }
     }
+}
+
+/// Converts a protobuf-JSON value (the encoding `writeAck`
+/// transform results use) to the value model. A map value
+/// whose only field is `__decimal128__` is the driver's
+/// encoding of a decimal transform result.
+fn proto_json_to_value(json: &Json) -> Value {
+    let Some(map) = json.as_object() else {
+        return json_to_value(json);
+    };
+    if let Some(fields) = map.get("mapValue").and_then(|v| v.get("fields")) {
+        if let Some(object) = fields.as_object() {
+            if object.len() == 1 {
+                if let Some(wrapper) = object.get("__decimal128__") {
+                    if let Some(string) = wrapper.get("stringValue").and_then(Json::as_str) {
+                        return Value::Decimal128(string.to_string());
+                    }
+                }
+            }
+        }
+        return Value::Map(json_fields(fields));
+    }
+    if let Some(string) = map.get("stringValue").and_then(Json::as_str) {
+        return Value::String(string.to_string());
+    }
+    if let Some(integer) = map.get("integerValue") {
+        if let Some(value) = integer.as_i64() {
+            return Value::Integer(value);
+        }
+        if let Some(value) = integer.as_str().and_then(|v| v.parse().ok()) {
+            return Value::Integer(value);
+        }
+    }
+    if let Some(double) = map.get("doubleValue").and_then(Json::as_f64) {
+        return Value::Double(double);
+    }
+    if let Some(boolean) = map.get("booleanValue").and_then(Json::as_bool) {
+        return Value::Bool(boolean);
+    }
+    if map.contains_key("nullValue") {
+        return Value::Null;
+    }
+    if let Some(values) = map
+        .get("arrayValue")
+        .and_then(|v| v.get("values"))
+        .and_then(Json::as_array)
+    {
+        return Value::Array(values.iter().map(proto_json_to_value).collect());
+    }
+    if let Some(seconds) = map.get("timestampValue").and_then(Json::as_str) {
+        // RFC 3339; the harness's transform results are
+        // numeric in practice, but parse the common shape.
+        let _ = seconds;
+    }
+    json_to_value(json)
+}
+
+/// Splits spec write data into literal fields, field
+/// transforms and field deletions. A field whose value is a
+/// `{"_methodName": ...}` object is a transform (top-level
+/// fields only, as in the SDKs' data model). An unknown
+/// method is an error the caller turns into a skip.
+fn split_transforms(
+    data: &Json,
+) -> Result<(Fields, Vec<crate::mutation::FieldTransform>, Vec<String>), String> {
+    // The error is the skip reason for the case.
+    let mut fields = Fields::new();
+    let mut transforms = Vec::new();
+    let mut deletes = Vec::new();
+    let Some(map) = data.as_object() else {
+        return Ok((fields, transforms, deletes));
+    };
+    for (key, value) in map {
+        let method = value
+            .as_object()
+            .and_then(|object| object.get("_methodName"))
+            .and_then(Json::as_str);
+        let Some(method) = method else {
+            if contains_transform(value) {
+                return Err("nested field transforms not modeled".to_string());
+            }
+            fields.insert(key.clone(), json_to_value(value));
+            continue;
+        };
+        let operand = value.get("_operand").cloned().unwrap_or(Json::Null);
+        let kind = match method {
+            "serverTimestamp" => crate::mutation::TransformKind::ServerTimestamp,
+            "increment" => crate::mutation::TransformKind::Increment(json_to_value(&operand)),
+            "arrayUnion" | "arrayRemove" => {
+                let elements = match &operand {
+                    Json::Array(items) => items.iter().map(json_to_value).collect(),
+                    other => vec![json_to_value(other)],
+                };
+                if method == "arrayUnion" {
+                    crate::mutation::TransformKind::ArrayUnion(elements)
+                } else {
+                    crate::mutation::TransformKind::ArrayRemove(elements)
+                }
+            }
+            "delete" => {
+                deletes.push(key.clone());
+                continue;
+            }
+            other => {
+                return Err(format!("transform method '{other}' not modeled"));
+            }
+        };
+        transforms.push(crate::mutation::FieldTransform {
+            path: key.clone(),
+            kind,
+        });
+    }
+    Ok((fields, transforms, deletes))
 }
 
 fn json_fields(json: &Json) -> Fields {
@@ -320,6 +444,18 @@ struct Harness {
     /// The owning user of each queued batch, in queue order,
     /// aligned with the store's batch list.
     batch_users: Vec<String>,
+    /// Locally computed transform results per queued batch
+    /// (aligned with the queue): a transform's local estimate
+    /// is computed once, when the batch is enqueued, and the
+    /// composed view keeps showing it — over any base movement
+    /// and, via `committed_estimates`, after the fold — until
+    /// the watch confirms the write. Only then does the
+    /// server's exact value (installed by the fold from the
+    /// acknowledgement's transform results) surface.
+    batch_estimates: Vec<std::collections::BTreeMap<(String, String), Value>>,
+    /// Transform estimates of folded batches awaiting watch
+    /// confirmation, keyed by (document, field path).
+    committed_estimates: std::collections::BTreeMap<(String, String), Value>,
     /// Resume tokens as last *persisted*, per target, with the
     /// snapshot version at which they were persisted. Live
     /// tokens (`target_tokens`) can be newer; a restart falls
@@ -464,6 +600,8 @@ impl Harness {
             listen_delivered: false,
             current_user: String::new(),
             batch_users: Vec::new(),
+            batch_estimates: Vec::new(),
+            committed_estimates: std::collections::BTreeMap::new(),
             persisted_tokens: std::collections::HashMap::new(),
             current_token_pending: false,
             armed_db_failures: std::collections::HashSet::new(),
@@ -794,6 +932,8 @@ impl Harness {
                 self.flush_pending_remote();
                 self.committed_unconfirmed
                     .retain(|_, commit| *commit > read_micros);
+                self.committed_estimates
+                    .retain(|(key, _), _| self.committed_unconfirmed.contains_key(key));
             }
         }
         let Some(state) = self.state.as_mut() else {
@@ -813,8 +953,35 @@ impl Harness {
         }
         let mut snapshot_emitted = false;
         match event {
-            Some(WatchEvent::Snapshot(snapshot)) => {
+            Some(WatchEvent::Snapshot(mut snapshot)) => {
                 snapshot_emitted = true;
+                // The watch state speaks protobuf, which has no
+                // decimal number kind: documents it emits carry
+                // the f64 approximation of any Decimal128 field.
+                // The harness's cache holds the exact values of
+                // the SAME delivery, so substitute those back
+                // (the local store in the reference holds exact
+                // values). Only the same version qualifies — a
+                // newer cache entry is a delivery whose
+                // consistent point has not arrived.
+                for document in snapshot.documents.iter_mut().chain(
+                    snapshot
+                        .changes
+                        .iter_mut()
+                        .map(|change| &mut change.document),
+                ) {
+                    let key = key_of(&document.name);
+                    if let Some((Some(cached), version)) = self.cache.get(&key) {
+                        let doc_micros = document
+                            .update_time
+                            .as_ref()
+                            .map(|time| time.seconds * 1_000_000 + (time.nanos / 1000) as i64)
+                            .unwrap_or(0);
+                        if *version == doc_micros {
+                            *document = cached.clone();
+                        }
+                    }
+                }
                 self.delivered_queries
                     .insert(self.current_query_sig.clone());
                 self.pending_view.clear();
@@ -955,6 +1122,8 @@ impl Harness {
             .unwrap_or(false);
         if confirmed {
             self.committed_unconfirmed.remove(&key);
+            self.committed_estimates
+                .retain(|(estimate_key, _), _| estimate_key != &key);
         }
         let _ = engine.store_remote_document_if_newer(document);
         self.store_remote_keys.insert(key);
@@ -1000,7 +1169,24 @@ impl Harness {
                     || change.target_ids.contains(&self.target_id)
                 {
                     if let Some(proto) = &change.document {
-                        if let Ok(document) = Document::from_proto(proto.clone()) {
+                        if let Ok(mut document) = Document::from_proto(proto.clone()) {
+                            // As with watch snapshots, the proto
+                            // round trip loses decimal precision:
+                            // substitute the cache's exact
+                            // document for the same version.
+                            let key = key_of(&document.name);
+                            if let Some((Some(cached), version)) = self.cache.get(&key) {
+                                let doc_micros = document
+                                    .update_time
+                                    .as_ref()
+                                    .map(|time| {
+                                        time.seconds * 1_000_000 + (time.nanos / 1000) as i64
+                                    })
+                                    .unwrap_or(0);
+                                if *version == doc_micros {
+                                    document = cached.clone();
+                                }
+                            }
                             self.pending_remote.push(RemoteUpdate::Document(document));
                         }
                     }
@@ -1211,9 +1397,30 @@ impl Harness {
             self.callback_rejected.insert(mutation.path().to_string());
             return;
         }
+        // The transform estimates are what the composed view
+        // shows for the transformed fields from now until the
+        // watch confirms the write: computed by applying the
+        // mutation locally over the current view.
+        let mut estimates = std::collections::BTreeMap::new();
+        if !mutation.transforms().is_empty() {
+            if let Some(engine) = self.engine.clone() {
+                let key = mutation.path().to_string();
+                let view = self.local_document_filtered(&engine, &key);
+                if let Some(document) = mutation.apply_to_local(view) {
+                    for transform in mutation.transforms() {
+                        if let Some(value) =
+                            crate::mutation::lookup_path(&document.fields, &transform.path)
+                        {
+                            estimates.insert((key.clone(), transform.path.clone()), value.clone());
+                        }
+                    }
+                }
+            }
+        }
         if let Some(engine) = &self.engine {
             if engine.store().enqueue_batch(&[mutation]).is_ok() {
                 self.batch_users.push(self.current_user.clone());
+                self.batch_estimates.push(estimates);
             }
         }
     }
@@ -1262,6 +1469,26 @@ impl Harness {
             .remote_document(&format!("{DOCUMENTS_PREFIX}/{key}"))
             .ok()
             .flatten();
+        // The store persists documents as protobuf bytes, a
+        // round trip that approximates Decimal128 fields as
+        // doubles. The harness's cache holds the exact values
+        // of the same delivery (the reference's local store
+        // holds exact values), so substitute the base before
+        // overlaying mutations. Only an equal version
+        // qualifies: a newer cache entry has not reached its
+        // consistent point in the store yet.
+        if let Some(base) = &document {
+            if let Some((Some(cached), version)) = self.cache.get(key) {
+                let base_micros = base
+                    .update_time
+                    .as_ref()
+                    .map(|time| time.seconds * 1_000_000 + (time.nanos / 1000) as i64)
+                    .unwrap_or(0);
+                if *version == base_micros {
+                    document = Some(cached.clone());
+                }
+            }
+        }
         let batches = store.peek_batches(usize::MAX).ok()?;
         for (index, batch) in batches.iter().enumerate() {
             let owner = self.batch_users.get(index).map_or("", |user| user.as_str());
@@ -1278,6 +1505,29 @@ impl Harness {
                     }
                 }
             }
+            // The batch's transform estimates override the
+            // recomputation over a possibly moved base.
+            if let Some(document) = document.as_mut() {
+                if let Some(estimates) = self.batch_estimates.get(index) {
+                    for ((estimate_key, path), value) in estimates {
+                        if estimate_key == key {
+                            crate::mutation::set_path(&mut document.fields, path, value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Folded-but-unconfirmed transform results still show
+        // their local estimates.
+        if self.committed_unconfirmed.contains_key(key) {
+            if let Some(document) = document.as_mut() {
+                let committed = self.committed_estimates.clone();
+                for ((estimate_key, path), value) in &committed {
+                    if estimate_key == key {
+                        crate::mutation::set_path(&mut document.fields, path, value.clone());
+                    }
+                }
+            }
         }
         document
     }
@@ -1288,7 +1538,12 @@ impl Harness {
     /// Returns whether any settled document already had a
     /// remote base (the watch had delivered it): only then does
     /// an acknowledgement raise a listener event.
-    fn settle_oldest(&mut self, ack: bool, commit: Timestamp) -> bool {
+    fn settle_oldest(
+        &mut self,
+        ack: bool,
+        commit: Timestamp,
+        transform_results: &[Vec<Value>],
+    ) -> bool {
         let Some(engine) = self.engine.clone() else {
             return false;
         };
@@ -1329,10 +1584,18 @@ impl Harness {
             .collect();
         self.last_settled = paths.clone();
         if ack {
-            if engine.fold_acknowledgement(&batch, commit).is_ok() {
+            if engine
+                .fold_acknowledgement_with_results(&batch, commit, transform_results)
+                .is_ok()
+            {
                 if !self.batch_users.is_empty() {
                     self.batch_users.remove(0);
                 }
+                let settled_estimates = if self.batch_estimates.is_empty() {
+                    std::collections::BTreeMap::new()
+                } else {
+                    self.batch_estimates.remove(0)
+                };
                 for mutation in &batch.mutations {
                     let path = mutation.path();
                     // A fold that leaves no base row (a delete,
@@ -1364,11 +1627,21 @@ impl Harness {
                         self.committed_unconfirmed.insert(path, commit_micros);
                     }
                 }
+                // Transform estimates survive the fold only
+                // while the write awaits watch confirmation.
+                for (estimate_key, value) in settled_estimates {
+                    if self.committed_unconfirmed.contains_key(&estimate_key.0) {
+                        self.committed_estimates.insert(estimate_key, value);
+                    }
+                }
                 self.callback_acked.extend(paths);
             }
         } else if store.remove_batch(batch.id).is_ok() {
             if !self.batch_users.is_empty() {
                 self.batch_users.remove(0);
+            }
+            if !self.batch_estimates.is_empty() {
+                self.batch_estimates.remove(0);
             }
             self.callback_rejected.extend(paths);
         }
@@ -1840,14 +2113,16 @@ fn run_case(case: &Json) -> Outcome {
                         .unwrap_or_default()
                         .to_string();
                     let data = args.get(1).cloned().unwrap_or(Json::Null);
-                    if contains_transform(&data) {
-                        return Outcome::Skipped("field transforms not modeled".to_string());
-                    }
+                    let (fields, transforms, _deletes) = match split_transforms(&data) {
+                        Ok(parts) => parts,
+                        Err(reason) => return Outcome::Skipped(reason),
+                    };
                     harness.enqueue_spec(Mutation::Set {
                         path,
-                        fields: json_fields(&data),
+                        fields,
                         merge_paths: None,
                         exists: None,
+                        transforms,
                     });
                     harness.maybe_emit_composed(&mut emitted, false, false, true);
                 }
@@ -1859,16 +2134,18 @@ fn run_case(case: &Json) -> Outcome {
                         .unwrap_or_default()
                         .to_string();
                     let data = args.get(1).cloned().unwrap_or(Json::Null);
-                    if contains_transform(&data) {
-                        return Outcome::Skipped("field transforms not modeled".to_string());
-                    }
-                    let fields = json_fields(&data);
-                    let mask: Vec<String> = fields.keys().cloned().collect();
+                    let (fields, transforms, deletes) = match split_transforms(&data) {
+                        Ok(parts) => parts,
+                        Err(reason) => return Outcome::Skipped(reason),
+                    };
+                    let mut mask: Vec<String> = fields.keys().cloned().collect();
+                    mask.extend(deletes);
                     harness.enqueue_spec(Mutation::Patch {
                         path,
                         fields,
                         mask,
                         exists: None,
+                        transforms,
                     });
                     harness.maybe_emit_composed(&mut emitted, false, false, true);
                 }
@@ -1900,7 +2177,7 @@ fn run_case(case: &Json) -> Outcome {
                             // client and re-listens.
                             let commit = ts_from_micros(version);
                             let acked_before = harness.callback_acked.clone();
-                            harness.settle_oldest(true, commit);
+                            harness.settle_oldest(true, commit, &[]);
                             // The fold stands, but the callbacks
                             // it produced are withheld until the
                             // restart delivers them.
@@ -1951,7 +2228,12 @@ fn run_case(case: &Json) -> Outcome {
                     // server-confirmed view); otherwise the flip
                     // surfaces with the watch event that delivers
                     // the document.
-                    let gate = harness.settle_oldest(true, commit);
+                    let transform_results: Vec<Vec<Value>> = value
+                        .get("transformResults")
+                        .and_then(Json::as_array)
+                        .map(|results| vec![results.iter().map(proto_json_to_value).collect()])
+                        .unwrap_or_default();
+                    let gate = harness.settle_oldest(true, commit, &transform_results);
                     let before = emitted.len();
                     harness.maybe_emit_composed(&mut emitted, false, false, gate);
                     if emitted.len() == before {
@@ -1986,7 +2268,7 @@ fn run_case(case: &Json) -> Outcome {
                                 "cross-user settle order not modeled".to_string(),
                             );
                         } else {
-                            harness.settle_oldest(false, ts_from_micros(0));
+                            harness.settle_oldest(false, ts_from_micros(0), &[]);
                             harness.maybe_emit_composed(&mut emitted, false, false, true);
                         }
                     }
@@ -2075,7 +2357,7 @@ fn run_case(case: &Json) -> Outcome {
                             harness.target_failed = false;
                         } else {
                             while let Some((ack, commit)) = harness.deferred_settles.pop_front() {
-                                let gate = harness.settle_oldest(ack, commit);
+                                let gate = harness.settle_oldest(ack, commit, &[]);
                                 let before = emitted.len();
                                 harness.maybe_emit_composed(&mut emitted, false, false, gate);
                                 if emitted.len() == before {
