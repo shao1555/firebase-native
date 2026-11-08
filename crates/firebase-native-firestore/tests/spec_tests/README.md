@@ -46,11 +46,28 @@ layers, so the runner covers the **watch layer** today:
   at the next barrier, while a global snapshot's token
   persists only once it is at least five minutes ahead of the
   last persisted snapshot version.
+- **Limbo resolution is modeled**: documents a target cannot
+  account for — a document-remove message, an existence
+  filter's failing bloom set, a target reset, a re-run's
+  unconfirmed remainder, or unconfirmed seeded documents of a
+  fresh target — stay in the view as limbo candidates and are
+  verified on document targets (at most two resolutions run
+  concurrently; batches enqueued by a target reset start only
+  half of them, rounded up). Existence filters are *decided*
+  against the view as of receipt but *applied* at the next
+  consistent point, mirroring the reference client's
+  "handled at global snapshot" behavior; a mismatch re-runs
+  the target (its unconfirmed documents become candidates at
+  the re-run's consistent point), and a failed resolution
+  (its target removed) settles immediately. The reported
+  resume token follows the reference rules: while a target
+  has outstanding limbo documents it reads the token the
+  target was added with; a clean consistent point promotes
+  the live token.
 - Cases needing machinery that does not exist yet are reported
   as **skipped with a reason**, never silently passed: multiple
   clients/tabs (including primary election), multiple
-  concurrent targets, query limits, bloom existence filters
-  and mismatch limbo resolution, and snapshots-in-sync
+  concurrent targets, query limits, and snapshots-in-sync
   listeners.
 
 Current results: **listen** (66 cases) 29 passed / 37 skipped /
@@ -77,9 +94,12 @@ transform result, as the two Decimal128 cases pin down: a
 queued transform's transformed fields show the estimate
 computed at enqueue time, over any base movement and past
 the fold, until the watch confirms the write.
-**Recovery** (25 cases) 15 passed / 10 skipped / 0 failed —
-the skips are multi-client scenarios (7), limbo documents (2)
-and multiple concurrent targets (1). `failDatabase` arms
+**Recovery** (25 cases) 17 passed / 8 skipped / 0 failed —
+the skips are multi-client scenarios (7) and multiple
+concurrent targets (1); the two limbo cases (a limbo
+acknowledgement / rejection whose persistence fails, which
+terminates the client and restarts its resolution after the
+async-queue retry) now pass. `failDatabase` arms
 named local-store operations to fail once at their next
 invocation; the harness models the reference outcomes:
 target allocation failures fail the listen with UNAVAILABLE,
@@ -97,7 +117,7 @@ its view from cache. `notifyLocalViewChanges` failures are
 consumed without effect, because this harness applies store
 changes before notifying listeners, so a failed notification
 cannot roll anything back — the behavior the cases pin down.
-**Offline** (10 cases) 9 passed / 1 skipped / 0 failed: the
+**Offline** (10 cases) 10 passed / 0 skipped / 0 failed: the
 harness models the reference online-state tracker (a fresh
 client is Unknown and its queries wait; a successful watch
 message makes it Online; from Unknown a single stream failure
@@ -107,18 +127,28 @@ firing via `runTimer` — goes Offline; removing the last
 listener resets the tracker to Unknown). Going Offline
 resolves the active listen from cache, and a listen registered
 while Offline (or with the network disabled) resolves
-immediately. The skipped case needs limbo documents.
+immediately; a listen with outstanding limbo documents does
+not resolve from cache until they settle.
 **Resume token** (2 cases) 2 passed / 0 skipped. **Existence
-filter** (26 cases) 2 passed / 24 skipped / 0 failed: the
-matching-count cases pass through `WatchState`'s filter
-handling, while bloom-filter cases and count mismatches are
-skipped — resolving either needs the sync engine's limbo /
-target re-run orchestration (the reference client verifies
-possibly-deleted documents on a separate limbo target before
-removing them), which this crate does not have yet. In the real
-protocol a mismatch restarts the watch without its resume
-token, which `WatchState` already signals; the spec harness's
-stepwise limbo resolution is what is not modeled.
+filter** (26 cases) 24 passed / 2 skipped / 0 failed: bloom
+filters (the crate's own MD5-based `BloomFilter` probes them),
+count mismatches with their target re-runs, filters applied
+at global snapshots, and limbo resolutions of the failing
+documents all run; the skips are the very-large-batch case
+(fifty concurrent limbo resolutions; the modeled batch
+throttling caps a batch at two) and a multiple-concurrent-
+targets case. **Limbo** (26 cases) 11 passed / 15 skipped /
+0 failed — the single-client, single-target cases cover
+document-remove limbo, existence-filter and reset limbo,
+the throttling batches, and failed resolutions; the skips
+are multiple concurrent targets (8), multiple clients (5)
+and query limits (2). The production watch layer gained the
+matching pieces: existence filters are decided at receipt
+and applied at consistent points, a restart keeps the view
+and marks its documents restart-unconfirmed (deleted at the
+re-run's consistent point by default, or reported as limbo
+candidates under the caller's policy), and seeded
+unconfirmed documents follow the same policy.
 
 Two verification properties are worth noting. Resume tokens are
 held per target, synced from the watch state after every
@@ -126,14 +156,12 @@ response, restored into new listens, and compared exactly
 against `expectedState.activeTargets[*].resumeToken`; at each
 (re)add the harness also builds the request through the
 driver's real `add_target_request` and checks the token it
-would send. And whether an existence filter is a supported
-matching-count case is decided from the harness's own view
-(emitted documents plus the pending overlay), independently of
-the implementation's restart signal — a restart on a matching
-filter *fails* the case. Both properties were validated by
-fault injection: making `WatchState` discard received tokens
-fails both resume-token cases, and making it restart on every
-filter fails both matching-count cases (skips unchanged).
+would send. And whether an existence filter matches is
+decided from the harness's own view (emitted documents plus
+the pending overlay), independently of the implementation's
+filter outcome. Fault injection backs the wiring: making the
+deferred-filter application drop its restart signal fails 10
+existence-filter cases and 2 limbo cases.
 
 ## The write-mode harness
 
