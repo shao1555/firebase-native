@@ -32,7 +32,7 @@ use crate::google::firestore::v1::listen_response::ResponseType;
 use crate::google::firestore::v1::target_change::TargetChangeType;
 use crate::google::firestore::v1::{ListenRequest, ListenResponse, Target, TargetChange};
 use crate::query::Order;
-use crate::value::{Document, Timestamp, Value};
+use crate::value::{Document, Timestamp};
 
 /// The target ID used for every watch. A Listen stream created by
 /// this client carries exactly one target.
@@ -657,68 +657,7 @@ impl WatchState {
     }
 
     fn compare_documents(&self, a: &Document, b: &Document) -> std::cmp::Ordering {
-        use std::cmp::Ordering::*;
-        for order in &self.orders {
-            let cmp = field_value(a, &order.field).compare(&field_value(b, &order.field));
-            let cmp = if order.descending { cmp.reverse() } else { cmp };
-            if cmp != Equal {
-                return cmp;
-            }
-        }
-        // Implicit __name__ tiebreak; its direction follows the last
-        // explicit ordering, per the server semantics.
-        let name_cmp = compare_names(&a.name, &b.name);
-        if self.orders.last().is_some_and(|order| order.descending) {
-            name_cmp.reverse()
-        } else {
-            name_cmp
-        }
-    }
-}
-
-/// The value a document sorts by for one ordering field: `__name__`
-/// is the document reference; any other field is a field *path*
-/// whose segments traverse nested maps. A path that cannot be fully
-/// resolved sorts as `Null`.
-fn field_value(document: &Document, field: &str) -> Value {
-    if field == "__name__" {
-        return Value::Reference(document.name.clone());
-    }
-    let segments = crate::path::parse_field_path(field);
-    let mut segments = segments.iter();
-    let Some(first) = segments.next() else {
-        return Value::Null;
-    };
-    let mut current = match document.fields.get(first) {
-        Some(value) => value,
-        None => return Value::Null,
-    };
-    for segment in segments {
-        match current {
-            Value::Map(map) => match map.get(segment) {
-                Some(value) => current = value,
-                None => return Value::Null,
-            },
-            _ => return Value::Null,
-        }
-    }
-    current.clone()
-}
-
-/// Compares full document resource names segment by segment.
-fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut left = a.split('/');
-    let mut right = b.split('/');
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(l), Some(r)) => match l.cmp(r) {
-                std::cmp::Ordering::Equal => continue,
-                ordering => return ordering,
-            },
-        }
+        crate::query::compare_by_orders(&self.orders, a, b)
     }
 }
 
@@ -932,7 +871,7 @@ async fn run_watch(
         let mut client = match grpc_client(channel.clone(), &options, &tokens, force_refresh).await
         {
             Ok(client) => client,
-            Err(error) if is_transient_token_error(&error) => {
+            Err(error) if is_transient_error(&error) => {
                 // Acquiring the token hit a transient failure (e.g.
                 // the network is down while a refresh is due). The
                 // watch must survive outages: back off and retry
@@ -1036,10 +975,13 @@ async fn run_watch(
     }
 }
 
-/// Whether acquiring a token failed transiently (transport or
-/// retryable service errors) as opposed to permanently (no session,
-/// rejected credentials, configuration errors).
-pub(crate) fn is_transient_token_error(error: &Error) -> bool {
+/// Whether a failure is transient (transport or retryable
+/// service errors) as opposed to permanent (no session, rejected
+/// credentials, configuration errors, validation). Used for
+/// token-acquisition retries in the watch driver and for the
+/// persistent `run_query` offline fallback, which must only
+/// engage on connectivity failures.
+pub(crate) fn is_transient_error(error: &Error) -> bool {
     match error {
         Error::Http(_) => true,
         // REST failures from the Auth token endpoints: throttling
@@ -1096,6 +1038,7 @@ mod tests {
         DocumentChange as ProtoDocumentChange, DocumentDelete as ProtoDocumentDelete,
         ExistenceFilter,
     };
+    use crate::value::Value;
     use crate::Fields;
 
     const PREFIX: &str = "projects/p/databases/d/documents";
@@ -1495,19 +1438,15 @@ mod tests {
 
     #[test]
     fn token_error_classification() {
-        assert!(is_transient_token_error(&Error::Http(
-            "offline".to_string()
-        )));
-        assert!(is_transient_token_error(&Error::Rpc {
+        assert!(is_transient_error(&Error::Http("offline".to_string())));
+        assert!(is_transient_error(&Error::Rpc {
             code: "Unavailable".to_string(),
             message: "down".to_string(),
         }));
-        assert!(!is_transient_token_error(&Error::Unauthenticated(
+        assert!(!is_transient_error(&Error::Unauthenticated(
             "no user".to_string()
         )));
-        assert!(!is_transient_token_error(&Error::Other(
-            "bad config".to_string()
-        )));
+        assert!(!is_transient_error(&Error::Other("bad config".to_string())));
         // Auth REST statuses: throttling/server errors retry,
         // client errors and status-less API errors do not.
         let api = |status: Option<u16>| Error::Api {
@@ -1516,12 +1455,12 @@ mod tests {
             message: "x".to_string(),
         };
         for status in [429, 500, 502, 503, 504] {
-            assert!(is_transient_token_error(&api(Some(status))), "{status}");
+            assert!(is_transient_error(&api(Some(status))), "{status}");
         }
         for status in [400, 401, 403, 404] {
-            assert!(!is_transient_token_error(&api(Some(status))), "{status}");
+            assert!(!is_transient_error(&api(Some(status))), "{status}");
         }
-        assert!(!is_transient_token_error(&api(None)));
+        assert!(!is_transient_error(&api(None)));
     }
 
     #[tokio::test]

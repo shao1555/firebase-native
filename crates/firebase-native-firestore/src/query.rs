@@ -157,6 +157,64 @@ pub struct Order {
     pub descending: bool,
 }
 
+/// The value a document sorts by for one ordering field:
+/// `__name__` is the document reference; any other field is a
+/// field path whose segments traverse nested maps. A path that
+/// cannot be fully resolved sorts as `Null`.
+pub(crate) fn order_value(document: &crate::value::Document, field: &str) -> Value {
+    if field == "__name__" {
+        return Value::Reference(document.name.clone());
+    }
+    crate::mutation::lookup_path(&document.fields, field)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Compares two documents under an ordering: each clause in
+/// turn under the Firestore total order, then the implicit
+/// `__name__` tiebreak whose direction follows the last clause
+/// (ascending when there are none), per the server semantics.
+/// This is the one ordering implementation: the watch layer
+/// sorts its snapshots with it, and local query evaluation
+/// sorts store candidates with it, so the two can never drift.
+pub(crate) fn compare_by_orders(
+    orders: &[Order],
+    a: &crate::value::Document,
+    b: &crate::value::Document,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    for order in orders {
+        let cmp = order_value(a, &order.field).compare(&order_value(b, &order.field));
+        let cmp = if order.descending { cmp.reverse() } else { cmp };
+        if cmp != Equal {
+            return cmp;
+        }
+    }
+    let name_cmp = compare_names(&a.name, &b.name);
+    if orders.last().is_some_and(|order| order.descending) {
+        name_cmp.reverse()
+    } else {
+        name_cmp
+    }
+}
+
+/// Compares full document resource names segment by segment.
+fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut left = a.split('/');
+    let mut right = b.split('/');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(l), Some(r)) => match l.cmp(r) {
+                std::cmp::Ordering::Equal => continue,
+                ordering => return ordering,
+            },
+        }
+    }
+}
+
 impl Order {
     /// Ascending order on a field.
     pub fn asc(field: impl Into<String>) -> Self {
@@ -193,20 +251,26 @@ pub struct Query {
 
 impl Query {
     /// Whether a document satisfies this query's filters, under
-    /// local evaluation. Used by the spec-test harness now and by
-    /// local query evaluation over the store later; collection /
-    /// document path matching is the caller's job. Semantics
-    /// mirror the server's: comparisons use the Firestore total
-    /// order, and a missing field matches nothing except the
-    /// unary tests that explicitly accept it (none do — `IsNull`
-    /// requires an explicit null, as on the server).
-    // Staged for local query evaluation over the store;
-    // exercised today by the spec-test harness.
-    #[allow(dead_code)]
+    /// local evaluation. Collection / document path matching is
+    /// the caller's job. Semantics mirror the server's:
+    /// comparisons use the Firestore total order, and a missing
+    /// field matches nothing except the unary tests that
+    /// explicitly accept it (none do — `IsNull` requires an
+    /// explicit null, as on the server).
     pub(crate) fn matches(&self, document: &crate::value::Document) -> bool {
         self.filters.iter().all(|filter| match filter {
             Filter::Field { field, op, value } => {
-                let Some(actual) = crate::mutation::lookup_path(&document.fields, field) else {
+                // `__name__` is the document reference: it lives
+                // in the document's name, not its fields (the
+                // shared ordering code resolves it the same way).
+                let name_reference;
+                let actual = if field == "__name__" {
+                    name_reference = Value::Reference(document.name.clone());
+                    Some(&name_reference)
+                } else {
+                    crate::mutation::lookup_path(&document.fields, field)
+                };
+                let Some(actual) = actual else {
                     return false;
                 };
                 use std::cmp::Ordering::*;
@@ -247,7 +311,13 @@ impl Query {
                 }
             }
             Filter::Unary { field, op } => {
-                let actual = crate::mutation::lookup_path(&document.fields, field);
+                let name_reference;
+                let actual = if field == "__name__" {
+                    name_reference = Value::Reference(document.name.clone());
+                    Some(&name_reference)
+                } else {
+                    crate::mutation::lookup_path(&document.fields, field)
+                };
                 match op {
                     UnaryOp::IsNull => matches!(actual, Some(Value::Null)),
                     UnaryOp::IsNotNull => matches!(actual, Some(value) if *value != Value::Null),
@@ -260,6 +330,56 @@ impl Query {
                 }
             }
         })
+    }
+
+    /// The collection this query targets.
+    pub(crate) fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
+    /// A copy of this query without limit or offset, for
+    /// fetching the full candidate set that a local evaluation
+    /// then paginates exactly once.
+    pub(crate) fn without_pagination(&self) -> Query {
+        let mut query = self.clone();
+        query.limit = None;
+        query.offset = None;
+        query
+    }
+
+    /// Evaluates the query locally over candidate documents
+    /// (the caller supplies every document in the target
+    /// collection, e.g. the local store's views): filters by
+    /// [`Query::matches`], drops documents missing an ordering
+    /// field (the server only returns documents that have every
+    /// field named by the effective ordering), sorts with the
+    /// shared ordering implementation, then applies offset and
+    /// limit.
+    pub(crate) fn evaluate(
+        &self,
+        candidates: Vec<crate::value::Document>,
+    ) -> Vec<crate::value::Document> {
+        let orders = self.effective_orders();
+        let mut documents: Vec<crate::value::Document> = candidates
+            .into_iter()
+            .filter(|document| self.matches(document))
+            .filter(|document| {
+                orders.iter().all(|order| {
+                    order.field == "__name__"
+                        || crate::mutation::lookup_path(&document.fields, &order.field).is_some()
+                })
+            })
+            .collect();
+        documents.sort_by(|a, b| compare_by_orders(&orders, a, b));
+        if let Some(offset) = self.offset {
+            let offset = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+            documents = documents.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = self.limit {
+            let limit = usize::try_from(limit.max(0)).unwrap_or(0);
+            documents.truncate(limit);
+        }
+        documents
     }
 
     /// Starts a query on a collection (its ID, not a full path:
@@ -484,6 +604,163 @@ mod tests {
             });
             assert!(query.effective_orders().is_empty(), "{op:?}");
         }
+    }
+
+    fn document(name: &str, fields: &[(&str, Value)]) -> crate::value::Document {
+        crate::value::Document {
+            name: name.to_string(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect(),
+            create_time: None,
+            update_time: None,
+        }
+    }
+
+    fn names(documents: &[crate::value::Document]) -> Vec<String> {
+        documents
+            .iter()
+            .map(|document| document.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn evaluate_orders_limits_and_offsets() {
+        let prefix = "projects/p/databases/d/documents/notes/";
+        let candidates = vec![
+            document(&format!("{prefix}c"), &[("rank", Value::Integer(3))]),
+            document(&format!("{prefix}a"), &[("rank", Value::Integer(2))]),
+            document(&format!("{prefix}b"), &[("rank", Value::Integer(1))]),
+        ];
+        let query = Query::new("notes").order_by(Order::asc("rank"));
+        assert_eq!(
+            names(&query.evaluate(candidates.clone())),
+            [
+                format!("{prefix}b"),
+                format!("{prefix}a"),
+                format!("{prefix}c")
+            ]
+        );
+        // Descending reverses the values and the name tiebreak.
+        let query = Query::new("notes").order_by(Order::desc("rank")).limit(2);
+        assert_eq!(
+            names(&query.evaluate(candidates.clone())),
+            [format!("{prefix}c"), format!("{prefix}a")]
+        );
+        let query = Query::new("notes").order_by(Order::asc("rank")).offset(1);
+        assert_eq!(
+            names(&query.evaluate(candidates)),
+            [format!("{prefix}a"), format!("{prefix}c")]
+        );
+    }
+
+    #[test]
+    fn evaluate_matches_name_filters() {
+        let prefix = "projects/p/databases/d/documents/notes/";
+        let candidates = vec![
+            document(&format!("{prefix}a"), &[("rank", Value::Integer(1))]),
+            document(&format!("{prefix}b"), &[("rank", Value::Integer(2))]),
+        ];
+        // Equality on the document reference: `__name__` lives
+        // in the document's name, not its fields.
+        let query = Query::new("notes").filter(Filter::Field {
+            field: "__name__".to_string(),
+            op: FieldOp::Equal,
+            value: Value::Reference(format!("{prefix}a")),
+        });
+        assert_eq!(
+            names(&query.evaluate(candidates.clone())),
+            [format!("{prefix}a")]
+        );
+        // A range over names.
+        let query = Query::new("notes").filter(Filter::Field {
+            field: "__name__".to_string(),
+            op: FieldOp::GreaterThan,
+            value: Value::Reference(format!("{prefix}a")),
+        });
+        assert_eq!(
+            names(&query.evaluate(candidates.clone())),
+            [format!("{prefix}b")]
+        );
+        // Membership in a list of references.
+        let query = Query::new("notes").filter(Filter::Field {
+            field: "__name__".to_string(),
+            op: FieldOp::In,
+            value: Value::Array(vec![Value::Reference(format!("{prefix}b"))]),
+        });
+        assert_eq!(names(&query.evaluate(candidates)), [format!("{prefix}b")]);
+        // The unary tests see the reference too: a name is
+        // never null or NaN.
+        let query = Query::new("notes").filter(Filter::Unary {
+            field: "__name__".to_string(),
+            op: UnaryOp::IsNotNull,
+        });
+        assert_eq!(query.evaluate(vec![]).len(), 0);
+        let candidates = vec![document(&format!("{prefix}a"), &[])];
+        assert_eq!(query.evaluate(candidates).len(), 1);
+    }
+
+    #[test]
+    fn without_pagination_keeps_filters_and_orders() {
+        let query = Query::new("notes")
+            .filter(Filter::eq("spaceId", Value::String("x".to_string())))
+            .order_by(Order::desc("rank"))
+            .limit(5)
+            .offset(2);
+        let unpaginated = query.without_pagination();
+        assert_eq!(unpaginated.limit, None);
+        assert_eq!(unpaginated.offset, None);
+        let proto = unpaginated.to_proto();
+        assert!(proto.r#where.is_some());
+        assert_eq!(proto.order_by.len(), 1);
+        assert_eq!(proto.limit, None);
+        assert_eq!(proto.offset, 0);
+    }
+
+    #[test]
+    fn evaluate_excludes_documents_missing_the_order_field() {
+        let prefix = "projects/p/databases/d/documents/notes/";
+        let candidates = vec![
+            document(&format!("{prefix}a"), &[("rank", Value::Integer(1))]),
+            document(
+                &format!("{prefix}b"),
+                &[("title", Value::String("x".into()))],
+            ),
+        ];
+        // Ordered: b has no rank and the server would not return it.
+        let query = Query::new("notes").order_by(Order::asc("rank"));
+        assert_eq!(
+            names(&query.evaluate(candidates.clone())),
+            [format!("{prefix}a")]
+        );
+        // Unordered: both are candidates, in name order.
+        let query = Query::new("notes");
+        assert_eq!(
+            names(&query.evaluate(candidates)),
+            [format!("{prefix}a"), format!("{prefix}b")]
+        );
+    }
+
+    #[test]
+    fn evaluate_applies_filters_with_ordering() {
+        let prefix = "projects/p/databases/d/documents/notes/";
+        let candidates = vec![
+            document(&format!("{prefix}a"), &[("rank", Value::Integer(1))]),
+            document(&format!("{prefix}b"), &[("rank", Value::Integer(5))]),
+            document(&format!("{prefix}c"), &[("rank", Value::Integer(3))]),
+        ];
+        let query = Query::new("notes")
+            .filter(Filter::Field {
+                field: "rank".to_string(),
+                op: FieldOp::GreaterThan,
+                value: Value::Integer(1),
+            })
+            .order_by(Order::asc("rank"));
+        assert_eq!(
+            names(&query.evaluate(candidates)),
+            [format!("{prefix}c"), format!("{prefix}b")]
+        );
     }
 
     #[test]
