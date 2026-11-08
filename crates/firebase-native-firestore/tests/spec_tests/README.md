@@ -65,6 +65,26 @@ restarts, persisted mutations visible to listeners, and
 persisted remote documents. **Write** (59 cases) 39 passed /
 20 skipped / 0 failed — skips are multi-client scenarios (18)
 and field transforms (2).
+**Recovery** (25 cases) 15 passed / 10 skipped / 0 failed —
+the skips are multi-client scenarios (7), limbo documents (2)
+and multiple concurrent targets (1). `failDatabase` arms
+named local-store operations to fail once at their next
+invocation; the harness models the reference outcomes:
+target allocation failures fail the listen with UNAVAILABLE,
+locally-write failures reject the batch unsurfaced, release
+failures are swallowed, remote-event failures discard the
+event and deactivate the target until the async-queue retry
+re-listens it, user-change transaction failures terminate
+the client (queued changes then apply one per retry), and
+acknowledgement/rejection persistence failures are retried
+by the async queue — with a listener attached the
+acknowledgement failure is fatal to the session instead:
+the fold is applied in memory, its callback is withheld
+until the restart delivers it, and the listener re-raises
+its view from cache. `notifyLocalViewChanges` failures are
+consumed without effect, because this harness applies store
+changes before notifying listeners, so a failed notification
+cannot roll anything back — the behavior the cases pin down.
 **Offline** (10 cases) 9 passed / 1 skipped / 0 failed: the
 harness models the reference online-state tracker (a fresh
 client is Unknown and its queries wait; a successful watch

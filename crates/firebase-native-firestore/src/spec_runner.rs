@@ -330,6 +330,37 @@ struct Harness {
     persisted_tokens: std::collections::HashMap<i32, (String, i64)>,
     /// A CURRENT token was noted since the last barrier.
     current_token_pending: bool,
+    /// Local-store operations armed to fail by `failDatabase`
+    /// steps; each armed operation fails once, at its next
+    /// invocation.
+    armed_db_failures: std::collections::HashSet<String>,
+    /// Settlements (ack, commit time) whose persistence failed
+    /// and which the async queue retries at the next
+    /// `async_queue_retry` timer.
+    deferred_settles: std::collections::VecDeque<(bool, Timestamp)>,
+    /// The client terminated on a failed user-change
+    /// transaction; it restarts at the next async-queue retry,
+    /// applying queued user changes one at a time.
+    terminated: bool,
+    pending_user_changes: std::collections::VecDeque<String>,
+    /// The listen (target, query JSON) to restore when a
+    /// terminated client recovers.
+    terminated_listen: Option<(i32, Json)>,
+    /// The active target's last remote event could not be
+    /// persisted: the target is inactive until the next
+    /// async-queue retry re-listens it internally.
+    target_failed: bool,
+    /// A target allocation failed earlier in this case: a
+    /// later listen may then supersede the active one (the
+    /// recovery cases re-listen a second query while the first
+    /// is still registered; steps only address the new target
+    /// afterwards).
+    saw_alloc_failure: bool,
+    /// Write callbacks withheld by a fatal acknowledgement
+    /// failure (the fold was applied in memory but its
+    /// persistence failed): the restart at the async-queue
+    /// retry delivers them.
+    deferred_callbacks: Vec<String>,
     /// The last emitted snapshot's documents, by relative key:
     /// the active listen's view.
     view: BTreeMap<String, Document>,
@@ -340,6 +371,14 @@ struct Harness {
     /// cannot resurrect them; stale remote events change
     /// nothing.
     cache: BTreeMap<String, (Option<Document>, i64)>,
+    /// The cache as of the last applied remote event. Remote
+    /// events are transactions: `watchEntity` updates are staged
+    /// in `cache` as they stream in and become persisted state
+    /// only when the event's barrier is applied. A barrier whose
+    /// persistence fails restores this snapshot, so the failed
+    /// event's documents cannot surface after a restart or a
+    /// later listen.
+    committed_cache: BTreeMap<String, (Option<Document>, i64)>,
     /// The active listen was seeded fresh (no resume token):
     /// documents its first snapshot removes were synthesized
     /// deletes and leave the local store too.
@@ -427,8 +466,17 @@ impl Harness {
             batch_users: Vec::new(),
             persisted_tokens: std::collections::HashMap::new(),
             current_token_pending: false,
+            armed_db_failures: std::collections::HashSet::new(),
+            deferred_settles: std::collections::VecDeque::new(),
+            terminated: false,
+            pending_user_changes: std::collections::VecDeque::new(),
+            terminated_listen: None,
+            target_failed: false,
+            saw_alloc_failure: false,
+            deferred_callbacks: Vec::new(),
             view: BTreeMap::new(),
             cache: BTreeMap::new(),
+            committed_cache: BTreeMap::new(),
             fresh_seed: false,
             feed_snapshots: 0,
             engine: None,
@@ -589,6 +637,132 @@ impl Harness {
             self.online_state = OnlineState::Online;
             self.stream_failures = 0;
             self.offline_timeout_armed = false;
+        }
+    }
+
+    /// Consumes an armed database failure for `operation`:
+    /// true (once) if the operation fails this time.
+    fn db_op_fails(&mut self, operation: &str) -> bool {
+        self.armed_db_failures.remove(operation)
+    }
+
+    /// `notifyLocalViewChanges` failures are consumed without
+    /// effect at view-affecting operations: this harness applies
+    /// store changes before notifying listeners, so a failed
+    /// notification cannot roll anything back (the recovery
+    /// cases pin exactly that the documents still surface, and
+    /// stay surfaced, in this situation).
+    fn consume_notify_failure(&mut self) {
+        self.armed_db_failures.remove("notifyLocalViewChanges");
+    }
+
+    /// Terminates the client session on a fatal local-store
+    /// failure: the listen dies (its registration is remembered
+    /// for the restart) and the client restarts at the next
+    /// async-queue retry. Delivered-view bookkeeping survives,
+    /// so the recovery re-evaluation diffs against it.
+    fn terminate_session(&mut self) {
+        if self.state.is_some() && !self.unlistened {
+            let query_json = serde_json::from_str(&self.current_query_sig).unwrap_or(Json::Null);
+            self.terminated_listen = Some((self.target_id, query_json));
+        }
+        self.state = None;
+        self.unlistened = true;
+        self.pending_remote.clear();
+        self.terminated = true;
+    }
+
+    /// Terminates the client on a failed user-change
+    /// transaction, queueing the requested change for the
+    /// async-queue retry that restarts the client.
+    fn terminate_for_user_change(&mut self, uid: String) {
+        self.terminate_session();
+        self.pending_user_changes.push_back(uid);
+    }
+
+    /// Restarts a terminated client at an async-queue retry:
+    /// applies the oldest queued user change, restores the
+    /// terminated listen, and re-evaluates the composed view.
+    fn recover_terminated(&mut self, emitted: &mut Vec<Emitted>) {
+        self.terminated = false;
+        self.callback_acked
+            .extend(std::mem::take(&mut self.deferred_callbacks));
+        if let Some(uid) = self.pending_user_changes.pop_front() {
+            self.current_user = uid;
+        }
+        if let Some((target_id, query_json)) = self.terminated_listen.take() {
+            if let Ok(query) = parse_query(&query_json) {
+                self.target_id = target_id;
+                self.query = Some(query.clone());
+                self.query_path = query_json
+                    .get("path")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.current_query_sig = serde_json::to_string(&query_json).unwrap_or_default();
+                let seed: Vec<Document> = self
+                    .cache
+                    .iter()
+                    .filter_map(|(key, (document, _))| {
+                        let document = document.as_ref()?;
+                        (path_matches(&self.query_path, key) && query.matches(document))
+                            .then(|| document.clone())
+                    })
+                    .collect();
+                let mut state = WatchState::new(target_id, query.effective_orders());
+                state.seed_view(seed, false);
+                if let Some(token) = self.target_tokens.get(&target_id).cloned() {
+                    state.restore_resume_token(token.into_bytes());
+                }
+                self.state = Some(state);
+                self.unlistened = false;
+                self.listen_delivered = true;
+            }
+        }
+        if self.write_mode {
+            let composed = self.composed_view();
+            let content_changed = composed.len() != self.delivered_docs.len()
+                || composed.iter().any(|(key, document)| {
+                    self.delivered_docs
+                        .get(key)
+                        .map(|old| old.fields != document.fields)
+                        .unwrap_or(true)
+                });
+            if content_changed {
+                self.maybe_emit_composed(emitted, false, false, true);
+            } else {
+                // Only mutation flags or snapshot metadata
+                // moved across the termination (e.g. a fold
+                // applied while the session was down): absorb
+                // them silently — they surface with the next
+                // watch confirmation, not at the restart.
+                self.delivered_docs = composed.clone();
+                if let Some(engine) = &self.engine {
+                    // The absorbed flags must come from the
+                    // current user's batch subset, like every
+                    // other flag computation: the shared queue
+                    // would leak another user's pending writes
+                    // into the recovered listener's metadata.
+                    let flags: BTreeMap<String, (bool, bool)> = composed
+                        .keys()
+                        .map(|key| {
+                            (
+                                key.clone(),
+                                (
+                                    self.has_pending_filtered(engine, key),
+                                    self.committed_unconfirmed.contains_key(key),
+                                ),
+                            )
+                        })
+                        .collect();
+                    self.delivered_flags = flags;
+                }
+                let has_pending = self
+                    .delivered_flags
+                    .values()
+                    .any(|(local, committed)| *local || *committed);
+                self.delivered_meta = (self.is_from_cache(), has_pending);
+            }
         }
     }
 
@@ -1030,6 +1204,13 @@ impl Harness {
     }
 
     fn enqueue_spec(&mut self, mutation: Mutation) {
+        self.consume_notify_failure();
+        if self.db_op_fails("Locally write mutations") {
+            // The batch could not be persisted: it is rejected
+            // outright — never queued, never surfaced.
+            self.callback_rejected.insert(mutation.path().to_string());
+            return;
+        }
         if let Some(engine) = &self.engine {
             if engine.store().enqueue_batch(&[mutation]).is_ok() {
                 self.batch_users.push(self.current_user.clone());
@@ -1355,12 +1536,59 @@ fn run_case(case: &Json) -> Outcome {
         let at = |message: String| format!("step {index}: {message}");
         let mut emitted: Vec<Emitted> = Vec::new();
         harness.resolved_waits = 0;
+        // A step whose expected state holds limbo documents is
+        // where limbo resolution starts to matter: the case is
+        // verified up to this point and skips here.
+        if step
+            .get("expectedState")
+            .and_then(|state| state.get("activeLimboDocs"))
+            .and_then(Json::as_array)
+            .map(|docs| !docs.is_empty())
+            .unwrap_or(false)
+        {
+            return Outcome::Skipped("limbo documents not modeled".to_string());
+        }
         for (key, value) in step.as_object().map(|o| o.iter()).into_iter().flatten() {
             match key.as_str() {
                 "expectedSnapshotEvents"
                 | "expectedState"
                 | "expectedWaitForPendingWritesEvents" => {}
                 "clientIndex" | "drainQueue" | "applyClientState" => {}
+                "failDatabase" => {
+                    // Arms local-store operations to fail once, at
+                    // their next invocation; a non-list value
+                    // (`false`) disarms. Operations outside the
+                    // modeled set skip the case rather than risk
+                    // a false pass.
+                    const MODELED: [&str; 9] = [
+                        "Allocate target",
+                        "Release target",
+                        "Locally write mutations",
+                        "Acknowledge batch",
+                        "Reject batch",
+                        "Apply remote event",
+                        "Get last remote snapshot version",
+                        "Handle user change",
+                        "notifyLocalViewChanges",
+                    ];
+                    match &value {
+                        Json::Array(items) => {
+                            harness.armed_db_failures = items
+                                .iter()
+                                .filter_map(Json::as_str)
+                                .map(str::to_string)
+                                .collect();
+                        }
+                        _ => harness.armed_db_failures.clear(),
+                    }
+                    if let Some(op) = harness
+                        .armed_db_failures
+                        .iter()
+                        .find(|op| !MODELED.contains(&op.as_str()))
+                    {
+                        return Outcome::Skipped(format!("database failure of '{op}' not modeled"));
+                    }
+                }
                 "enableNetwork" => {
                     let online = value.as_bool().unwrap_or(true);
                     if harness.write_mode {
@@ -1390,6 +1618,14 @@ fn run_case(case: &Json) -> Outcome {
                     harness.online = online;
                 }
                 "userListen" => {
+                    if harness.db_op_fails("Allocate target") {
+                        // Target allocation is a local-store
+                        // operation: its failure fails the listen
+                        // with UNAVAILABLE and allocates nothing.
+                        harness.saw_alloc_failure = true;
+                        emitted.push(Emitted::Error(14));
+                        continue;
+                    }
                     if harness.state.is_some() && !harness.unlistened {
                         // A second concurrent listen is only
                         // modeled when the client is offline (or
@@ -1397,7 +1633,9 @@ fn run_case(case: &Json) -> Outcome {
                         // then resolves from cache and no further
                         // steps address the superseded target.
                         let offline_now = !harness.write_mode
-                            && (harness.online_state == OnlineState::Offline || !harness.online);
+                            && (harness.online_state == OnlineState::Offline
+                                || !harness.online
+                                || harness.saw_alloc_failure);
                         if !offline_now {
                             return Outcome::Skipped("multiple concurrent targets".to_string());
                         }
@@ -1550,6 +1788,24 @@ fn run_case(case: &Json) -> Outcome {
                     harness.had_listen = true;
                 }
                 "changeUser" => {
+                    let requested_user = match &value {
+                        Json::String(uid) => Some(uid.clone()),
+                        Json::Null => Some(String::new()),
+                        _ => None,
+                    };
+                    if let Some(uid) = requested_user {
+                        if harness.terminated {
+                            // Changes requested while the client
+                            // is down queue for the retry that
+                            // restarts it.
+                            harness.pending_user_changes.push_back(uid);
+                            continue;
+                        }
+                        if harness.db_op_fails("Handle user change") {
+                            harness.terminate_for_user_change(uid);
+                            continue;
+                        }
+                    }
                     if harness.write_mode {
                         // Mutation queues are per-user: switching
                         // the current user changes which queued
@@ -1630,10 +1886,64 @@ fn run_case(case: &Json) -> Outcome {
                     harness.maybe_emit_composed(&mut emitted, false, false, true);
                 }
                 "writeAck" => {
+                    let version = value.get("version").and_then(Json::as_i64).unwrap_or(0);
+                    if harness.db_op_fails("Acknowledge batch") {
+                        if harness.delivered_valid {
+                            // With a listener attached, failing
+                            // to persist the acknowledgement is
+                            // fatal to the session: the fold is
+                            // applied in memory but the user
+                            // callback is never delivered, the
+                            // target goes down, and the listener
+                            // re-raises its view from cache. The
+                            // async-queue retry restarts the
+                            // client and re-listens.
+                            let commit = ts_from_micros(version);
+                            let acked_before = harness.callback_acked.clone();
+                            harness.settle_oldest(true, commit);
+                            // The fold stands, but the callbacks
+                            // it produced are withheld until the
+                            // restart delivers them.
+                            let withheld: Vec<String> = harness
+                                .callback_acked
+                                .difference(&acked_before)
+                                .cloned()
+                                .collect();
+                            harness.callback_acked = acked_before;
+                            harness.deferred_callbacks.extend(withheld);
+                            harness.terminate_session();
+                            harness.synced = false;
+                            let documents: Vec<Document> =
+                                harness.delivered_docs.values().cloned().collect();
+                            let has_pending = harness
+                                .delivered_flags
+                                .values()
+                                .any(|(local, committed)| *local || *committed);
+                            emitted.push(Emitted::Composed {
+                                snapshot: Snapshot {
+                                    documents,
+                                    changes: Vec::new(),
+                                    read_time: None,
+                                },
+                                from_cache: true,
+                                has_pending,
+                                metadata: Vec::new(),
+                                initial: false,
+                            });
+                        } else {
+                            // Without a listener, the
+                            // acknowledgement simply stays
+                            // outstanding until the async queue
+                            // retries persisting it.
+                            harness
+                                .deferred_settles
+                                .push_back((true, ts_from_micros(version)));
+                        }
+                        continue;
+                    }
                     if harness.cross_user_settle_ahead() {
                         return Outcome::Skipped("cross-user settle order not modeled".to_string());
                     }
-                    let version = value.get("version").and_then(Json::as_i64).unwrap_or(0);
                     let commit: Timestamp = ts_from_micros(version);
                     // An acknowledgement raises an event only
                     // when the watch had already delivered the
@@ -1664,13 +1974,21 @@ fn run_case(case: &Json) -> Outcome {
                     // reported, the local view is unchanged.
                     let retryable = matches!(code, 1 | 2 | 4 | 10 | 13 | 14 | 16);
                     if !keep && !retryable {
-                        if harness.cross_user_settle_ahead() {
+                        if harness.db_op_fails("Reject batch") {
+                            // The rejection could not be
+                            // persisted: it stays outstanding
+                            // until the async queue retries it.
+                            harness
+                                .deferred_settles
+                                .push_back((false, ts_from_micros(0)));
+                        } else if harness.cross_user_settle_ahead() {
                             return Outcome::Skipped(
                                 "cross-user settle order not modeled".to_string(),
                             );
+                        } else {
+                            harness.settle_oldest(false, ts_from_micros(0));
+                            harness.maybe_emit_composed(&mut emitted, false, false, true);
                         }
-                        harness.settle_oldest(false, ts_from_micros(0));
-                        harness.maybe_emit_composed(&mut emitted, false, false, true);
                     }
                 }
                 "waitForPendingWrites" => {
@@ -1703,6 +2021,10 @@ fn run_case(case: &Json) -> Outcome {
                     }
                 }
                 "userUnlisten" => {
+                    // Releasing the target is a local-store
+                    // operation whose failure does not stop the
+                    // unlisten.
+                    let _ = harness.db_op_fails("Release target");
                     if harness.listen_saw_token {
                         harness.resumable_targets.insert(harness.target_id);
                     }
@@ -1724,10 +2046,48 @@ fn run_case(case: &Json) -> Outcome {
                     harness.note_watch_success();
                 }
                 "runTimer" => {
-                    // Fires the online-state timeout (the only
-                    // timer the harness models): a client that
-                    // never connected goes Offline, as does an
-                    // Online client whose stream failure armed
+                    // The async-queue retry drives failure
+                    // recovery: a terminated client restarts and
+                    // applies one queued user change, deferred
+                    // settlements are persisted, and a target
+                    // whose remote event could not be persisted
+                    // is re-listened internally.
+                    let async_retry = match &value {
+                        Json::String(name) => name == "async_queue_retry" || name == "all",
+                        Json::Array(items) => items.iter().any(|item| {
+                            matches!(item.as_str(), Some("async_queue_retry") | Some("all"))
+                        }),
+                        _ => false,
+                    };
+                    if async_retry {
+                        if harness.terminated {
+                            harness.recover_terminated(&mut emitted);
+                        } else if !harness.pending_user_changes.is_empty() {
+                            // Further user changes queued during
+                            // the outage apply one per retry tick.
+                            if let Some(uid) = harness.pending_user_changes.pop_front() {
+                                harness.current_user = uid;
+                            }
+                            if harness.write_mode {
+                                harness.maybe_emit_composed(&mut emitted, false, false, true);
+                            }
+                        } else if harness.target_failed {
+                            harness.target_failed = false;
+                        } else {
+                            while let Some((ack, commit)) = harness.deferred_settles.pop_front() {
+                                let gate = harness.settle_oldest(ack, commit);
+                                let before = emitted.len();
+                                harness.maybe_emit_composed(&mut emitted, false, false, gate);
+                                if emitted.len() == before {
+                                    harness.absorb_settled_flags();
+                                }
+                                harness.consume_notify_failure();
+                            }
+                        }
+                    }
+                    // Fires the online-state timeout: a client
+                    // that never connected goes Offline, as does
+                    // an Online client whose stream failure armed
                     // the timeout.
                     let fires = match &value {
                         Json::String(name) => name == "online_state_timeout" || name == "all",
@@ -1939,7 +2299,54 @@ fn run_case(case: &Json) -> Outcome {
                     if target_ids.contains(&harness.target_id) {
                         harness.note_token(&token);
                     }
-                    if target_ids.is_empty() {
+                    if target_ids.is_empty()
+                        && (harness.armed_db_failures.contains("Apply remote event")
+                            || harness
+                                .armed_db_failures
+                                .contains("Get last remote snapshot version"))
+                    {
+                        // The remote event cannot be persisted:
+                        // it is discarded wholesale — the watch
+                        // state is rebuilt from the delivered
+                        // view, the buffered updates are dropped,
+                        // and the target goes inactive until the
+                        // async-queue retry re-listens it. The
+                        // listener re-raises its view (now from
+                        // cache).
+                        let _ = harness.db_op_fails("Apply remote event");
+                        let _ = harness.db_op_fails("Get last remote snapshot version");
+                        harness.pending_remote.clear();
+                        // The event's cache updates were only
+                        // staged: roll them back to the last
+                        // applied event, and drop the event's
+                        // pending-view overlay with them.
+                        harness.cache = harness.committed_cache.clone();
+                        harness.pending_view.clear();
+                        if !harness.write_mode && harness.state.is_some() {
+                            let seed: Vec<Document> = harness.view.values().cloned().collect();
+                            let mut state = WatchState::new(
+                                harness.target_id,
+                                harness
+                                    .query
+                                    .as_ref()
+                                    .map(|query| query.effective_orders())
+                                    .unwrap_or_default(),
+                            );
+                            state.seed_view(seed.clone(), false);
+                            if let Some(token) =
+                                harness.target_tokens.get(&harness.target_id).cloned()
+                            {
+                                state.restore_resume_token(token.into_bytes());
+                            }
+                            harness.state = Some(state);
+                            harness.target_failed = true;
+                            emitted.push(Emitted::Snapshot(Snapshot {
+                                documents: seed,
+                                changes: Vec::new(),
+                                read_time: None,
+                            }));
+                        }
+                    } else if target_ids.is_empty() {
                         // Global barrier. A version behind the
                         // highest one already delivered belongs to
                         // a reverted stream: ignore it entirely.
@@ -1989,6 +2396,9 @@ fn run_case(case: &Json) -> Outcome {
                                 },
                                 &mut emitted,
                             );
+                            // The event is applied: its staged
+                            // cache updates become persisted state.
+                            harness.committed_cache = harness.cache.clone();
                         }
                     }
                 }
@@ -2205,6 +2615,7 @@ fn run_case(case: &Json) -> Outcome {
                 // inactive in the spec model.
                 let harness_active = harness.state.is_some()
                     && !harness.unlistened
+                    && !harness.target_failed
                     && harness.online
                     && harness.online_state != OnlineState::Offline;
                 if expects_none && harness_active {
@@ -2770,6 +3181,179 @@ fn pending_writes_scoped_to_current_user() {
                     event("modified", doc(serde_json::json!({"n": 1}), false), false)
                 ]
             }
+        ]
+    });
+    match run_case(&case) {
+        Outcome::Passed => {}
+        Outcome::Skipped(reason) => panic!("case unexpectedly skipped: {reason}"),
+        Outcome::Failed(message) => panic!("case failed: {message}"),
+    }
+}
+
+#[test]
+fn recovery_spec_suite() {
+    assert_suite("recovery_spec_test.json", "recovery");
+}
+
+/// Regression (not a vendored case): a remote event whose
+/// persistence fails is discarded wholesale — including its
+/// staged cache updates. Derived from the vendored recovery
+/// case "Recovers when watch update cannot be persisted", but
+/// restarting and re-listening *before* the event is replayed:
+/// the initial cached snapshot must contain only the document
+/// from the last applied event.
+#[test]
+fn failed_remote_event_rolls_back_cache() {
+    let query = serde_json::json!({
+        "filters": [],
+        "orderBys": [],
+        "path": "collection"
+    });
+    let doc = |key: &str, value: Json, version: i64| {
+        serde_json::json!({
+            "key": key,
+            "value": value,
+            "version": version,
+            "createTime": 0,
+            "options": {
+                "hasCommittedMutations": false,
+                "hasLocalMutations": false
+            }
+        })
+    };
+    let key1 = |version: i64| doc("collection/key1", serde_json::json!({"foo": "a"}), version);
+    let case = serde_json::json!({
+        "config": { "numClients": 1 },
+        "steps": [
+            { "userListen": { "query": query, "targetId": 2 } },
+            { "watchAck": [2] },
+            {
+                "watchEntity": {
+                    "docs": [key1(1000)],
+                    "targets": [2]
+                }
+            },
+            { "watchCurrent": [[2], "resume-token-1000"] },
+            {
+                "watchSnapshot": { "targetIds": [], "version": 1000 },
+                "expectedSnapshotEvents": [{
+                    "added": [key1(1000)],
+                    "errorCode": 0,
+                    "fromCache": false,
+                    "hasPendingWrites": false,
+                    "query": query
+                }]
+            },
+            {
+                "watchEntity": {
+                    "docs": [doc("collection/key2", serde_json::json!({"foo": "b"}), 2000)],
+                    "targets": [2]
+                }
+            },
+            { "failDatabase": ["Get last remote snapshot version"] },
+            {
+                "watchSnapshot": { "targetIds": [], "version": 1500 },
+                "expectedSnapshotEvents": [{
+                    "errorCode": 0,
+                    "fromCache": true,
+                    "hasPendingWrites": false,
+                    "query": query
+                }]
+            },
+            { "failDatabase": false },
+            { "restart": null },
+            {
+                "userListen": { "query": query, "targetId": 2 },
+                "expectedSnapshotEvents": [{
+                    "added": [key1(1000)],
+                    "errorCode": 0,
+                    "fromCache": true,
+                    "hasPendingWrites": false,
+                    "query": query
+                }]
+            }
+        ]
+    });
+    match run_case(&case) {
+        Outcome::Passed => {}
+        Outcome::Skipped(reason) => panic!("case unexpectedly skipped: {reason}"),
+        Outcome::Failed(message) => panic!("case failed: {message}"),
+    }
+}
+
+/// Regression (not a vendored case): the flags absorbed when a
+/// terminated session recovers come from the current user's
+/// batch subset, like every other flag computation. The default
+/// user's write is still queued when the client switches to
+/// user2, a change to user3 fails and the session recovers as
+/// user3: the content never moves, so recovery absorbs the
+/// flags silently — with the shared-queue check it recorded
+/// `hasPendingWrites` from the first user's batch, and the
+/// next barrier then raised a spurious metadata-only event
+/// correcting it. Here the final barrier must raise nothing.
+#[test]
+fn recovery_absorbs_flags_for_current_user() {
+    let query = serde_json::json!({
+        "filters": [],
+        "orderBys": [],
+        "path": "collection"
+    });
+    let doc = |value: Json, version: i64, local: bool| {
+        serde_json::json!({
+            "key": "collection/a",
+            "value": value,
+            "version": version,
+            "createTime": 0,
+            "options": {
+                "hasCommittedMutations": false,
+                "hasLocalMutations": local
+            }
+        })
+    };
+    let event = |group: &str, entry: Json, pending: bool| {
+        let mut event = serde_json::json!({
+            "errorCode": 0,
+            "fromCache": false,
+            "hasPendingWrites": pending,
+            "query": query
+        });
+        event[group] = serde_json::json!([entry]);
+        event
+    };
+    let case = serde_json::json!({
+        "config": { "numClients": 1 },
+        "steps": [
+            { "userListen": { "query": query, "targetId": 2 } },
+            { "watchAck": [2] },
+            {
+                "watchEntity": {
+                    "docs": [doc(serde_json::json!({"n": 1}), 1000, false)],
+                    "targets": [2]
+                }
+            },
+            { "watchCurrent": [[2], "resume-token-1000"] },
+            {
+                "watchSnapshot": { "targetIds": [], "version": 1000 },
+                "expectedSnapshotEvents": [
+                    event("added", doc(serde_json::json!({"n": 1}), 1000, false), false)
+                ]
+            },
+            {
+                "userSet": ["collection/a", { "n": 2 }],
+                "expectedSnapshotEvents": [
+                    event("modified", doc(serde_json::json!({"n": 2}), 0, true), true)
+                ]
+            },
+            {
+                "changeUser": "user2",
+                "expectedSnapshotEvents": [
+                    event("modified", doc(serde_json::json!({"n": 1}), 1000, false), false)
+                ]
+            },
+            { "failDatabase": ["Handle user change"] },
+            { "changeUser": "user3" },
+            { "runTimer": "async_queue_retry" },
+            { "watchSnapshot": { "targetIds": [], "version": 2000 } }
         ]
     });
     match run_case(&case) {
