@@ -9,11 +9,15 @@ wrapping the official Firebase C++ SDK. Pure Rust means it builds
 natively for every target Rust supports, including Windows on ARM64,
 for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 
-> Status: **P2 in progress** — Auth sign-in/refresh, Firestore unary
-> CRUD, the Listen stream (reconnect/resume), the local store, the
-> Write stream and offline persistence work against live projects.
-> The Firestore spec-test port is under way (the listen suite runs;
-> see `crates/firebase-native-firestore/tests/spec_tests/`). Storage
+> Status: **P2 complete** — Auth sign-in/refresh, Firestore unary
+> CRUD, the Listen stream (reconnect/resume, production limbo
+> resolution), the local store with offline persistence and
+> latency compensation, the Write stream, local query evaluation
+> and the FieldValue sentinel API work against live projects. The
+> P2 spec-test suites (listen, write, persistence, offline,
+> recovery, existence filter, resume token, limbo) pass against
+> the vendored firebase-ios-sdk corpus (see
+> `crates/firebase-native-firestore/tests/spec_tests/`). Storage
 > lands in P3.
 
 ## Crates
@@ -91,10 +95,11 @@ the vendored googleapis protos (pinned at commit
 ## Roadmap
 
 - **P0** — Skeleton, Auth, Firestore unary CRUD (online only). ✅
-- **P1** — Listen stream (online only), serializer golden tests.
+- **P1** — Listen stream (online only), serializer golden tests. ✅
 - **P2** — Local store, Write stream, offline persistence and
   recovery; spec-test runner and the listen/write/persistence/offline
-  suites.
+  suites; listen-through-store, local query evaluation, the public
+  FieldValue sentinel API, and production limbo resolution. ✅
 - **P3** — Storage implementation.
 - **P4** — Integration into a production native client app.
 
