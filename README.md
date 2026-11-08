@@ -9,10 +9,12 @@ wrapping the official Firebase C++ SDK. Pure Rust means it builds
 natively for every target Rust supports, including Windows on ARM64,
 for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 
-> Status: **P0** — skeleton and online-only core. Auth sign-in/refresh
-> and Firestore unary CRUD work against live projects. The Listen and
-> Write streams, the local store, and offline persistence land in
-> P1/P2; Storage lands in P3.
+> Status: **P2 in progress** — Auth sign-in/refresh, Firestore unary
+> CRUD, the Listen stream (reconnect/resume), the local store, the
+> Write stream and offline persistence work against live projects.
+> The Firestore spec-test port is under way (the listen suite runs;
+> see `crates/firebase-native-firestore/tests/spec_tests/`). Storage
+> lands in P3.
 
 ## Crates
 
