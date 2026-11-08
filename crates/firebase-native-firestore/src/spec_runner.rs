@@ -311,6 +311,25 @@ struct Harness {
     offline_timeout_armed: bool,
     /// Whether the active listen has emitted any snapshot.
     listen_delivered: bool,
+    /// The current user for mutation-queue purposes (the
+    /// anonymous user is the empty string): mutation batches
+    /// are per-user in the spec model, and only the current
+    /// user's batches are visible to listeners or settled by
+    /// acknowledgements.
+    current_user: String,
+    /// The owning user of each queued batch, in queue order,
+    /// aligned with the store's batch list.
+    batch_users: Vec<String>,
+    /// Resume tokens as last *persisted*, per target, with the
+    /// snapshot version at which they were persisted. Live
+    /// tokens (`target_tokens`) can be newer; a restart falls
+    /// back to the persisted ones. A target-specific (CURRENT)
+    /// token persists at the next barrier; a global snapshot's
+    /// token persists only once it is at least five minutes
+    /// ahead of the last persisted snapshot version.
+    persisted_tokens: std::collections::HashMap<i32, (String, i64)>,
+    /// A CURRENT token was noted since the last barrier.
+    current_token_pending: bool,
     /// The last emitted snapshot's documents, by relative key:
     /// the active listen's view.
     view: BTreeMap<String, Document>,
@@ -404,6 +423,10 @@ impl Harness {
             stream_failures: 0,
             offline_timeout_armed: false,
             listen_delivered: false,
+            current_user: String::new(),
+            batch_users: Vec::new(),
+            persisted_tokens: std::collections::HashMap::new(),
+            current_token_pending: false,
             view: BTreeMap::new(),
             cache: BTreeMap::new(),
             fresh_seed: false,
@@ -510,6 +533,52 @@ impl Harness {
             read_time: None,
         }));
         self.listen_delivered = true;
+    }
+
+    /// A client restart: streams, listeners and session
+    /// bookkeeping die; persisted state survives — the local
+    /// store (remote documents, the mutation queue, target
+    /// resume tokens) and the harness's document cache.
+    fn restart(&mut self) {
+        self.state = None;
+        self.unlistened = true;
+        self.pending_remote.clear();
+        self.pending_view.clear();
+        self.expected_view.clear();
+        self.feed_snapshots = 0;
+        self.online_state = OnlineState::Unknown;
+        self.stream_failures = 0;
+        self.offline_timeout_armed = false;
+        self.listen_delivered = false;
+        self.view.clear();
+        self.delivered_valid = false;
+        self.delivered_docs.clear();
+        self.delivered_flags.clear();
+        self.delivered_meta = (false, false);
+        self.committed_unconfirmed.clear();
+        self.folded_absent.clear();
+        self.waiters.clear();
+        self.synced = false;
+        self.last_settled.clear();
+        // Resume tokens fall back to their last persisted
+        // values; targets holding one are resumable.
+        self.target_tokens = self
+            .persisted_tokens
+            .iter()
+            .map(|(target, (token, _))| (*target, token.clone()))
+            .collect();
+        self.resumable_targets = self
+            .persisted_tokens
+            .keys()
+            .copied()
+            .filter(|target| {
+                self.persisted_tokens
+                    .get(target)
+                    .map(|(token, _)| !token.is_empty())
+                    .unwrap_or(false)
+            })
+            .collect();
+        self.current_token_pending = false;
     }
 
     /// A successful watch message: the client is Online, and
@@ -840,7 +909,7 @@ impl Harness {
             .into_iter()
             .filter(|key| path_matches(&self.query_path, key))
             .filter_map(|key| {
-                let document = engine.local_document(&key).ok().flatten()?;
+                let document = self.local_document_filtered(engine, &key)?;
                 query.matches(&document).then_some((key, document))
             })
             .collect()
@@ -871,7 +940,7 @@ impl Harness {
                 (
                     key.clone(),
                     (
-                        engine.has_pending(key).unwrap_or(false),
+                        self.has_pending_filtered(engine, key),
                         self.committed_unconfirmed.contains_key(key),
                     ),
                 )
@@ -962,8 +1031,74 @@ impl Harness {
 
     fn enqueue_spec(&mut self, mutation: Mutation) {
         if let Some(engine) = &self.engine {
-            let _ = engine.store().enqueue_batch(&[mutation]);
+            if engine.store().enqueue_batch(&[mutation]).is_ok() {
+                self.batch_users.push(self.current_user.clone());
+            }
         }
+    }
+
+    /// Whether the oldest queued batch belongs to another user
+    /// while a batch of the current user waits behind it: the
+    /// spec's acknowledgements settle the current user's oldest
+    /// batch, which the store's FIFO fold cannot express.
+    fn cross_user_settle_ahead(&self) -> bool {
+        let Some(front) = self.batch_users.first() else {
+            return false;
+        };
+        front != &self.current_user
+            && self
+                .batch_users
+                .iter()
+                .skip(1)
+                .any(|user| user == &self.current_user)
+    }
+
+    /// Whether any queued batch of the *current user* mutates
+    /// `key`. The pending-write flag must be derived from the
+    /// same batch subset as the composed content: the store's
+    /// queue is shared across users, so the engine's unfiltered
+    /// check would leak another user's mutation metadata into
+    /// this user's snapshot flags.
+    fn has_pending_filtered(&self, engine: &PersistenceEngine, key: &str) -> bool {
+        let Ok(batches) = engine.store().peek_batches(usize::MAX) else {
+            return false;
+        };
+        batches.iter().enumerate().any(|(index, batch)| {
+            self.batch_users.get(index).map_or("", |user| user.as_str()) == self.current_user
+                && batch
+                    .mutations
+                    .iter()
+                    .any(|mutation| mutation_path(mutation) == key)
+        })
+    }
+
+    /// The local view of one document for the current user:
+    /// the remote base overlaid with the current user's queued
+    /// mutations (other users' batches are invisible).
+    fn local_document_filtered(&self, engine: &PersistenceEngine, key: &str) -> Option<Document> {
+        let store = engine.store();
+        let mut document = store
+            .remote_document(&format!("{DOCUMENTS_PREFIX}/{key}"))
+            .ok()
+            .flatten();
+        let batches = store.peek_batches(usize::MAX).ok()?;
+        for (index, batch) in batches.iter().enumerate() {
+            let owner = self.batch_users.get(index).map_or("", |user| user.as_str());
+            if owner != self.current_user {
+                continue;
+            }
+            for mutation in &batch.mutations {
+                if mutation.path() == key {
+                    document = mutation.apply_to_local(document);
+                    if let Some(document) = document.as_mut() {
+                        if document.name.is_empty() {
+                            document.name = format!("{DOCUMENTS_PREFIX}/{key}");
+                        }
+                    }
+                }
+            }
+        }
+        document
     }
 
     /// Settles the oldest outstanding batch the way the spec's
@@ -1014,6 +1149,9 @@ impl Harness {
         self.last_settled = paths.clone();
         if ack {
             if engine.fold_acknowledgement(&batch, commit).is_ok() {
+                if !self.batch_users.is_empty() {
+                    self.batch_users.remove(0);
+                }
                 for mutation in &batch.mutations {
                     let path = mutation.path();
                     // A fold that leaves no base row (a delete,
@@ -1048,6 +1186,9 @@ impl Harness {
                 self.callback_acked.extend(paths);
             }
         } else if store.remove_batch(batch.id).is_ok() {
+            if !self.batch_users.is_empty() {
+                self.batch_users.remove(0);
+            }
             self.callback_rejected.extend(paths);
         }
         self.resolve_waiters();
@@ -1075,7 +1216,7 @@ impl Harness {
         for path in self.last_settled.clone() {
             if self.delivered_docs.contains_key(&path) {
                 let flags = (
-                    engine.has_pending(&path).unwrap_or(false),
+                    self.has_pending_filtered(&engine, &path),
                     self.committed_unconfirmed.contains_key(&path),
                 );
                 self.delivered_flags.insert(path, flags);
@@ -1410,9 +1551,20 @@ fn run_case(case: &Json) -> Outcome {
                 }
                 "changeUser" => {
                     if harness.write_mode {
-                        // Mutation queues are per-user; not
-                        // modeled.
-                        return Outcome::Skipped("user change not modeled".to_string());
+                        // Mutation queues are per-user: switching
+                        // the current user changes which queued
+                        // batches are visible, so the composed
+                        // view is re-evaluated.
+                        harness.current_user = match &value {
+                            Json::String(uid) => uid.clone(),
+                            Json::Null => String::new(),
+                            _ => {
+                                return Outcome::Skipped(
+                                    "changeUser shape not modeled".to_string(),
+                                );
+                            }
+                        };
+                        harness.maybe_emit_composed(&mut emitted, false, false, true);
                     }
                     // In a listen-only case a credential change
                     // restarts the streams but does not by
@@ -1478,6 +1630,9 @@ fn run_case(case: &Json) -> Outcome {
                     harness.maybe_emit_composed(&mut emitted, false, false, true);
                 }
                 "writeAck" => {
+                    if harness.cross_user_settle_ahead() {
+                        return Outcome::Skipped("cross-user settle order not modeled".to_string());
+                    }
                     let version = value.get("version").and_then(Json::as_i64).unwrap_or(0);
                     let commit: Timestamp = ts_from_micros(version);
                     // An acknowledgement raises an event only
@@ -1509,12 +1664,43 @@ fn run_case(case: &Json) -> Outcome {
                     // reported, the local view is unchanged.
                     let retryable = matches!(code, 1 | 2 | 4 | 10 | 13 | 14 | 16);
                     if !keep && !retryable {
+                        if harness.cross_user_settle_ahead() {
+                            return Outcome::Skipped(
+                                "cross-user settle order not modeled".to_string(),
+                            );
+                        }
                         harness.settle_oldest(false, ts_from_micros(0));
                         harness.maybe_emit_composed(&mut emitted, false, false, true);
                     }
                 }
                 "waitForPendingWrites" => {
                     harness.register_waiter();
+                }
+                "restart" => {
+                    harness.restart();
+                }
+                "shutdown" => {
+                    // The client stops: its listen dies and the
+                    // online-state cycle ends. Persisted state
+                    // is untouched; a later listen or restart
+                    // resumes from it.
+                    harness.state = None;
+                    harness.unlistened = true;
+                    harness.pending_remote.clear();
+                    harness.online_state = OnlineState::Unknown;
+                    harness.stream_failures = 0;
+                    harness.offline_timeout_armed = false;
+                }
+                "clearPersistence" => {
+                    // Everything persisted is wiped: a brand-new
+                    // harness (fresh store, cache and tokens),
+                    // keeping only the case's write-mode shape.
+                    let write_mode = harness.write_mode;
+                    harness = Harness::new();
+                    harness.write_mode = write_mode;
+                    if write_mode {
+                        harness.ensure_engine();
+                    }
                 }
                 "userUnlisten" => {
                     if harness.listen_saw_token {
@@ -1719,6 +1905,9 @@ fn run_case(case: &Json) -> Outcome {
                     );
                     if token_present {
                         harness.listen_saw_token = true;
+                        // A target-specific token persists at
+                        // the next barrier snapshot.
+                        harness.current_token_pending = true;
                     }
                 }
                 "watchSnapshot" => {
@@ -1756,6 +1945,38 @@ fn run_case(case: &Json) -> Outcome {
                         // a reverted stream: ignore it entirely.
                         if version >= harness.max_barrier {
                             harness.max_barrier = version;
+                            // Token persistence at the barrier: a
+                            // pending CURRENT token persists now,
+                            // at this snapshot version. A global
+                            // snapshot's own token persists only
+                            // once it is at least five minutes
+                            // (300,000,000 microseconds) ahead of
+                            // the last persisted snapshot version
+                            // — newer global tokens are omitted
+                            // "for a short while".
+                            if harness.current_token_pending {
+                                if let Some(live) =
+                                    harness.target_tokens.get(&harness.target_id).cloned()
+                                {
+                                    harness
+                                        .persisted_tokens
+                                        .insert(harness.target_id, (live, version));
+                                }
+                                harness.current_token_pending = false;
+                            }
+                            if !token.is_empty() {
+                                let token_string = String::from_utf8_lossy(&token).into_owned();
+                                let persisted_version = harness
+                                    .persisted_tokens
+                                    .get(&harness.target_id)
+                                    .map(|(_, version)| *version)
+                                    .unwrap_or(0);
+                                if version - persisted_version >= 300_000_000 {
+                                    harness
+                                        .persisted_tokens
+                                        .insert(harness.target_id, (token_string, version));
+                                }
+                            }
                             harness.feed(
                                 ListenResponse {
                                     response_type: Some(ResponseType::TargetChange(TargetChange {
@@ -2055,11 +2276,11 @@ fn run_case(case: &Json) -> Outcome {
                     // most 10 batches in flight; further batches
                     // wait in the queue and are not outstanding.
                     let actual = harness
-                        .engine
-                        .as_ref()
-                        .and_then(|engine| engine.store().batch_count().ok())
-                        .map(|count| count.min(10))
-                        .unwrap_or(usize::MAX);
+                        .batch_users
+                        .iter()
+                        .filter(|user| user.as_str() == harness.current_user.as_str())
+                        .count()
+                        .min(10);
                     if actual != expected_count as usize {
                         return Outcome::Failed(at(format!(
                             "numOutstandingWrites: expected {expected_count}, got {actual}"
@@ -2478,6 +2699,84 @@ fn resume_token_spec_suite() {
 #[test]
 fn offline_spec_suite() {
     assert_suite("offline_spec_test.json", "offline");
+}
+
+#[test]
+fn persistence_spec_suite() {
+    assert_suite("persistence_spec_test.json", "persistence");
+}
+
+/// Regression (not a vendored case): pending-write metadata is
+/// scoped to the current user. The default user overwrites a
+/// cached document; after switching to a user with no writes,
+/// the content reverts and `hasPendingWrites` must clear even
+/// though the first user's batch is still queued.
+#[test]
+fn pending_writes_scoped_to_current_user() {
+    let query = serde_json::json!({
+        "filters": [],
+        "orderBys": [],
+        "path": "collection"
+    });
+    let doc = |value: Json, local: bool| {
+        serde_json::json!({
+            "key": "collection/a",
+            "value": value,
+            "version": 0,
+            "createTime": 0,
+            "options": {
+                "hasCommittedMutations": false,
+                "hasLocalMutations": local
+            }
+        })
+    };
+    let event = |group: &str, entry: Json, pending: bool| {
+        let mut event = serde_json::json!({
+            "errorCode": 0,
+            "fromCache": false,
+            "hasPendingWrites": pending,
+            "query": query
+        });
+        event[group] = serde_json::json!([entry]);
+        event
+    };
+    let case = serde_json::json!({
+        "config": { "numClients": 1 },
+        "steps": [
+            { "userListen": { "query": query, "targetId": 2 } },
+            { "watchAck": [2] },
+            {
+                "watchEntity": {
+                    "docs": [doc(serde_json::json!({"n": 1}), false)],
+                    "targets": [2]
+                }
+            },
+            { "watchCurrent": [[2], "resume-token-500"] },
+            {
+                "watchSnapshot": { "targetIds": [], "version": 500 },
+                "expectedSnapshotEvents": [
+                    event("added", doc(serde_json::json!({"n": 1}), false), false)
+                ]
+            },
+            {
+                "userSet": ["collection/a", { "n": 2 }],
+                "expectedSnapshotEvents": [
+                    event("modified", doc(serde_json::json!({"n": 2}), true), true)
+                ]
+            },
+            {
+                "changeUser": "user2",
+                "expectedSnapshotEvents": [
+                    event("modified", doc(serde_json::json!({"n": 1}), false), false)
+                ]
+            }
+        ]
+    });
+    match run_case(&case) {
+        Outcome::Passed => {}
+        Outcome::Skipped(reason) => panic!("case unexpectedly skipped: {reason}"),
+        Outcome::Failed(message) => panic!("case failed: {message}"),
+    }
 }
 
 /// Vendoring integrity: every suite file parses and the case
