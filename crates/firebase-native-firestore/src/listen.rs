@@ -254,13 +254,29 @@ impl WatchState {
 
     /// Drains the limbo candidates produced at the last
     /// consistent point (full resource names).
-    // Exercised by the spec-test harness (and staged for
-    // store-backed watches in the driver).
-    #[allow(dead_code)]
     pub(crate) fn take_limbo_candidates(&mut self) -> Vec<String> {
         std::mem::take(&mut self.limbo_candidates)
             .into_iter()
             .collect()
+    }
+
+    /// The view as it will stand once pending changes land:
+    /// `docs` overlaid with `pending`. Decisions that must see
+    /// the in-flight remote event as well as the last emitted
+    /// view (limbo outcome application) use this.
+    pub(crate) fn effective_view(&self) -> Vec<Document> {
+        let mut view = self.docs.clone();
+        for (name, change) in &self.pending {
+            match change {
+                Some(document) => {
+                    view.insert(name.clone(), document.clone());
+                }
+                None => {
+                    view.remove(name);
+                }
+            }
+        }
+        view.into_values().collect()
     }
 
     /// Whether the target has been marked CURRENT since its
@@ -763,6 +779,18 @@ fn map_rpc_status(code: i32, message: &str) -> Error {
     }
 }
 
+/// The backend intermittently rejects a stream with a
+/// database-name mismatch even though the identical request
+/// succeeds on retry (observed on fresh Write streams during
+/// part 2a and on a fresh Listen stream during the part 2l live
+/// check). That specific failure is a routing hiccup, not a
+/// configuration error, so it is exempt from the terminal
+/// classification below and the stream restarts instead.
+fn is_database_mismatch(status: &tonic::Status) -> bool {
+    status.code() == Code::InvalidArgument
+        && status.message().contains("Mismatch between database name")
+}
+
 /// Whether a stream failure is terminal for the watch (no reconnect
 /// will fix it). Mirrors the official client's classification.
 fn is_terminal(code: Code) -> bool {
@@ -1144,6 +1172,9 @@ fn flush_remote(engine: &PersistenceEngine, buffer: &mut BTreeMap<String, Option
 }
 
 /// Spawns the driver task for one watch and returns its handle.
+/// `query` is the watch's query for query targets (used to
+/// decide limbo resolution outcomes); document watches pass
+/// `None` and never resolve limbo.
 pub(crate) fn spawn_watch(
     channel: Channel,
     options: FirebaseOptions,
@@ -1151,6 +1182,7 @@ pub(crate) fn spawn_watch(
     target: Target,
     orders: Vec<Order>,
     store_watch: Option<StoreWatch>,
+    query: Option<Query>,
 ) -> Listener {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     let task = tokio::spawn(async move {
@@ -1161,6 +1193,7 @@ pub(crate) fn spawn_watch(
             target,
             orders,
             store_watch,
+            query,
             sender,
         )
         .await;
@@ -1215,6 +1248,9 @@ fn response_action(state: &mut WatchState, response: ListenResponse) -> Response
     }
 }
 
+// The parameter list mirrors `spawn_watch`'s: the watch's full
+// construction context, assembled once by the client.
+#[allow(clippy::too_many_arguments)]
 async fn run_watch(
     channel: Channel,
     options: FirebaseOptions,
@@ -1222,10 +1258,17 @@ async fn run_watch(
     target: Target,
     orders: Vec<Order>,
     store_watch: Option<StoreWatch>,
+    query: Option<Query>,
     sender: tokio::sync::mpsc::Sender<Result<Snapshot>>,
 ) {
     let database = options.database_name();
     let mut state = WatchState::new(target.target_id, orders);
+    // Query watches verify unconfirmed documents individually
+    // (limbo resolution) instead of dropping them at the first
+    // consistent point; document watches keep the drop policy.
+    let limbo_enabled = query.is_some();
+    state.set_keep_restart_unconfirmed(limbo_enabled);
+    let mut limbo = LimboTracker::new();
     let mut backoff = Backoff::new();
     let mut force_refresh = false;
 
@@ -1298,7 +1341,7 @@ async fn run_watch(
         let mut stream = match client.listen(request).await {
             Ok(response) => response.into_inner(),
             Err(status) => {
-                if is_terminal(status.code()) {
+                if is_terminal(status.code()) && !is_database_mismatch(&status) {
                     let _ = sender.send(Err(map_status(status))).await;
                     return;
                 }
@@ -1313,6 +1356,12 @@ async fn run_watch(
                 continue 'reconnect;
             }
         };
+
+        // (Re)start any limbo resolutions the previous stream
+        // left queued.
+        if limbo_enabled {
+            limbo.pump(&request_sender, &database).await;
+        }
 
         // Mid-stream loop. `restart` asks for an immediate fresh
         // stream (existence-filter recovery), skipping the backoff.
@@ -1361,108 +1410,199 @@ async fn run_watch(
             };
             match message {
                 Ok(Some(response)) => {
-                    if store_watch.is_some() {
-                        buffer_remote(&response, target.target_id, &mut buffer, &mut view_only);
+                    // Limbo bookkeeping around the main state's
+                    // processing. Settled resolutions apply to
+                    // the query state before the barrier that
+                    // settled them is processed, so the snapshot
+                    // it produces already carries their outcomes;
+                    // a document-remove on the query target is
+                    // not a removal at all — the document is
+                    // verified individually instead of being fed
+                    // to the state; a failed resolution settles
+                    // as absent in the state's pending set, to
+                    // publish at the next real barrier.
+                    // `to_process` is the ordered list of
+                    // responses the main state sees.
+                    let mut to_process: Vec<ListenResponse> = Vec::new();
+                    if limbo_enabled {
+                        if is_settle_barrier(&response, target.target_id, &limbo) {
+                            for (limbo_target, key, outcome) in limbo.settle(&response) {
+                                apply_limbo_outcome(
+                                    &mut state,
+                                    query.as_ref(),
+                                    target.target_id,
+                                    &key,
+                                    outcome,
+                                    store_watch.is_some(),
+                                    &mut buffer,
+                                );
+                                let remove = ListenRequest {
+                                    database: database.clone(),
+                                    target_change: Some(RequestTargetChange::RemoveTarget(
+                                        limbo_target,
+                                    )),
+                                    labels: Default::default(),
+                                    request_options: None,
+                                };
+                                let _ = request_sender.send(remove).await;
+                            }
+                        }
+                        match &response.response_type {
+                            Some(ResponseType::DocumentRemove(remove))
+                                if remove.removed_target_ids.contains(&target.target_id) =>
+                            {
+                                limbo.enqueue(remove.document.clone());
+                                if store_watch.is_some() {
+                                    buffer_remote(
+                                        &response,
+                                        target.target_id,
+                                        &mut buffer,
+                                        &mut view_only,
+                                    );
+                                }
+                            }
+                            _ => {
+                                let failed = limbo.feed(&response);
+                                // A failed resolution settles as
+                                // absent, but only its own outcome
+                                // is applied (to the state's pending
+                                // set and the store buffer): it
+                                // publishes at the next real accepted
+                                // barrier. A synthetic barrier at
+                                // the last accepted read time would
+                                // also emit and flush unrelated
+                                // changes of the in-flight remote
+                                // event, at a stale version.
+                                for key in &failed {
+                                    apply_limbo_outcome(
+                                        &mut state,
+                                        query.as_ref(),
+                                        target.target_id,
+                                        key,
+                                        None,
+                                        store_watch.is_some(),
+                                        &mut buffer,
+                                    );
+                                }
+                                to_process.push(response);
+                            }
+                        }
+                    } else {
+                        to_process.push(response);
                     }
-                    let action = response_action(&mut state, response);
-                    // Whether the state machine accepted a
-                    // consistent point in this response (not
-                    // stale, addressed to this target): only
-                    // then does the buffered remote event
-                    // complete and land in the store.
-                    let accepted = state.take_consistent_point();
-                    match action {
-                        ResponseAction::Deliver(snapshot) => {
-                            backoff.reset();
-                            if let Some(watch) = &store_watch {
-                                reconcile_view_removals(
-                                    watch,
-                                    &last_state_docs,
-                                    &snapshot.documents,
-                                    &buffer,
-                                    &view_only,
-                                    snapshot.read_time.as_ref(),
-                                );
-                                flush_remote(&watch.engine, &mut buffer);
-                                view_only.clear();
-                                watch.persist_target(&state, snapshot.read_time);
-                                last_state_docs = snapshot.documents.clone();
-                                delivery.last_read_time = snapshot.read_time;
-                                if !delivery.emit(watch, &sender).await {
-                                    return;
-                                }
-                            } else if sender.send(Ok(snapshot)).await.is_err() {
-                                return;
-                            }
+                    for response in to_process {
+                        if store_watch.is_some() {
+                            buffer_remote(&response, target.target_id, &mut buffer, &mut view_only);
                         }
-                        ResponseAction::Restart(snapshot) => {
-                            restart = true;
-                            if let Some(watch) = &store_watch {
-                                // The event that restarted the
-                                // target is discarded: documents
-                                // the state dropped from its view
-                                // (the synthesized deletes) leave
-                                // the store through the same
-                                // reconciliation as an ordinary
-                                // delivery; the event's own puts
-                                // still land.
-                                reconcile_view_removals(
-                                    watch,
-                                    &last_state_docs,
-                                    snapshot
-                                        .as_ref()
-                                        .map(|snapshot| snapshot.documents.as_slice())
-                                        .unwrap_or(&[]),
-                                    &buffer,
-                                    &view_only,
-                                    snapshot
-                                        .as_ref()
-                                        .and_then(|snapshot| snapshot.read_time.as_ref()),
-                                );
-                                flush_remote(&watch.engine, &mut buffer);
-                                view_only.clear();
-                                watch.persist_target(
-                                    &state,
-                                    snapshot.as_ref().and_then(|snapshot| snapshot.read_time),
-                                );
-                                if let Some(snapshot) = &snapshot {
-                                    delivery.last_read_time = snapshot.read_time;
-                                    last_state_docs = snapshot.documents.clone();
-                                } else {
-                                    last_state_docs.clear();
-                                }
-                                if !delivery.emit(watch, &sender).await {
-                                    return;
-                                }
-                            } else if let Some(snapshot) = snapshot {
-                                let _ = sender.send(Ok(snapshot)).await;
-                            }
-                            break;
-                        }
-                        ResponseAction::Removed(error) => {
-                            if let Some(error) = error {
-                                let _ = sender.send(Err(error)).await;
-                            }
-                            return;
-                        }
-                        ResponseAction::Continue => {
-                            // An accepted consistent point that
-                            // produced no snapshot still completes
-                            // a remote event: apply its buffered
-                            // changes. (A stale or foreign barrier
-                            // is not accepted and flushes nothing.)
-                            if accepted {
+                        let action = response_action(&mut state, response);
+                        // Whether the state machine accepted a
+                        // consistent point in this response (not
+                        // stale, addressed to this target): only
+                        // then does the buffered remote event
+                        // complete and land in the store.
+                        let accepted = state.take_consistent_point();
+                        match action {
+                            ResponseAction::Deliver(snapshot) => {
+                                backoff.reset();
                                 if let Some(watch) = &store_watch {
+                                    reconcile_view_removals(
+                                        watch,
+                                        &last_state_docs,
+                                        &snapshot.documents,
+                                        &buffer,
+                                        &view_only,
+                                        snapshot.read_time.as_ref(),
+                                    );
                                     flush_remote(&watch.engine, &mut buffer);
                                     view_only.clear();
+                                    watch.persist_target(&state, snapshot.read_time);
+                                    last_state_docs = snapshot.documents.clone();
+                                    delivery.last_read_time = snapshot.read_time;
+                                    if !delivery.emit(watch, &sender).await {
+                                        return;
+                                    }
+                                } else if sender.send(Ok(snapshot)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            ResponseAction::Restart(snapshot) => {
+                                restart = true;
+                                if let Some(watch) = &store_watch {
+                                    // The event that restarted the
+                                    // target is discarded: documents
+                                    // the state dropped from its view
+                                    // (the synthesized deletes) leave
+                                    // the store through the same
+                                    // reconciliation as an ordinary
+                                    // delivery; the event's own puts
+                                    // still land.
+                                    reconcile_view_removals(
+                                        watch,
+                                        &last_state_docs,
+                                        snapshot
+                                            .as_ref()
+                                            .map(|snapshot| snapshot.documents.as_slice())
+                                            .unwrap_or(&[]),
+                                        &buffer,
+                                        &view_only,
+                                        snapshot
+                                            .as_ref()
+                                            .and_then(|snapshot| snapshot.read_time.as_ref()),
+                                    );
+                                    flush_remote(&watch.engine, &mut buffer);
+                                    view_only.clear();
+                                    watch.persist_target(
+                                        &state,
+                                        snapshot.as_ref().and_then(|snapshot| snapshot.read_time),
+                                    );
+                                    if let Some(snapshot) = &snapshot {
+                                        delivery.last_read_time = snapshot.read_time;
+                                        last_state_docs = snapshot.documents.clone();
+                                    } else {
+                                        last_state_docs.clear();
+                                    }
+                                    if !delivery.emit(watch, &sender).await {
+                                        return;
+                                    }
+                                } else if let Some(snapshot) = snapshot {
+                                    let _ = sender.send(Ok(snapshot)).await;
+                                }
+                                break 'stream;
+                            }
+                            ResponseAction::Removed(error) => {
+                                if let Some(error) = error {
+                                    let _ = sender.send(Err(error)).await;
+                                }
+                                return;
+                            }
+                            ResponseAction::Continue => {
+                                // An accepted consistent point that
+                                // produced no snapshot still completes
+                                // a remote event: apply its buffered
+                                // changes. (A stale or foreign barrier
+                                // is not accepted and flushes nothing.)
+                                if accepted {
+                                    if let Some(watch) = &store_watch {
+                                        flush_remote(&watch.engine, &mut buffer);
+                                        view_only.clear();
+                                    }
                                 }
                             }
                         }
+                    }
+                    // Candidates this processing produced start
+                    // resolving (and slots freed by settlements
+                    // are refilled).
+                    if limbo_enabled {
+                        for name in state.take_limbo_candidates() {
+                            limbo.enqueue(name);
+                        }
+                        limbo.pump(&request_sender, &database).await;
                     }
                 }
                 Ok(None) => break, // Server closed the stream; reconnect.
                 Err(status) => {
-                    if is_terminal(status.code()) {
+                    if is_terminal(status.code()) && !is_database_mismatch(&status) {
                         let _ = sender.send(Err(map_status(status))).await;
                         return;
                     }
@@ -1473,6 +1613,10 @@ async fn run_watch(
                 }
             }
         }
+
+        // The stream ended: in-flight limbo resolutions lose
+        // their wire targets and restart on the next stream.
+        limbo.restart_session();
 
         if sender.is_closed() {
             return;
@@ -1513,6 +1657,316 @@ pub(crate) fn is_transient_error(error: &Error) -> bool {
                 | "Cancelled"
         ),
         _ => false,
+    }
+}
+
+/// The most limbo resolutions (document targets) one watch
+/// runs at once; the rest queue. Document targets are cheap,
+/// but an existence-filter restart can nominate a whole cached
+/// collection at once.
+const MAX_CONCURRENT_LIMBO_RESOLUTIONS: usize = 10;
+
+/// One started limbo resolution: a document target verifying
+/// a single document the query target could not confirm (an
+/// existence-filter casualty, a document-remove on the query
+/// target, an unconfirmed seeded document).
+struct LimboRes {
+    /// The document's full resource name.
+    key: String,
+    target_id: i32,
+    state: WatchState,
+    /// The resolution's outcome, captured when its state first
+    /// emitted a snapshot (at a consistent point of its own):
+    /// `Some(Some(doc))` confirmed, `Some(None)` absent. The
+    /// outcome is applied at the next settle barrier, so a
+    /// state that emitted early (e.g. at a CURRENT carrying a
+    /// read time) is not lost.
+    ready: Option<Option<Document>>,
+}
+
+/// The driver's limbo bookkeeping for one watch: candidates
+/// waiting for a slot and the resolutions in flight. Mirrors
+/// the reference client's model (and the spec harness's): a
+/// candidate is verified by its own document target; the
+/// outcome lands on the query target at a stream-wide barrier.
+struct LimboTracker {
+    waiting: std::collections::VecDeque<String>,
+    active: Vec<LimboRes>,
+    next_target_id: i32,
+}
+
+impl LimboTracker {
+    fn new() -> Self {
+        Self {
+            waiting: std::collections::VecDeque::new(),
+            active: Vec::new(),
+            // The query target holds TARGET_ID (2); limbo
+            // targets take the following even ids.
+            next_target_id: TARGET_ID + 2,
+        }
+    }
+
+    /// Queues a candidate unless it is already waiting or in
+    /// flight.
+    fn enqueue(&mut self, name: String) {
+        if self.waiting.contains(&name) || self.active.iter().any(|res| res.key == name) {
+            return;
+        }
+        self.waiting.push_back(name);
+    }
+
+    fn is_limbo_target(&self, target_id: i32) -> bool {
+        self.active.iter().any(|res| res.target_id == target_id)
+    }
+
+    /// Starts waiting resolutions while a slot is free,
+    /// sending their document-target adds on the stream.
+    async fn pump(
+        &mut self,
+        request_sender: &tokio::sync::mpsc::Sender<ListenRequest>,
+        database: &str,
+    ) {
+        while self.active.len() < MAX_CONCURRENT_LIMBO_RESOLUTIONS {
+            let Some(key) = self.waiting.pop_front() else {
+                break;
+            };
+            let target_id = self.next_target_id;
+            self.next_target_id += 2;
+            let target = Target {
+                target_id,
+                once: false,
+                expected_count: None,
+                target_type: Some(crate::google::firestore::v1::target::TargetType::Documents(
+                    crate::google::firestore::v1::target::DocumentsTarget {
+                        documents: vec![key.clone()],
+                    },
+                )),
+                resume_type: None,
+            };
+            let request = ListenRequest {
+                database: database.to_string(),
+                target_change: Some(RequestTargetChange::AddTarget(target)),
+                labels: Default::default(),
+                request_options: None,
+            };
+            if request_sender.send(request).await.is_err() {
+                // The stream is gone; the resolution restarts
+                // with the next stream (see `restart_session`).
+                self.waiting.push_front(key);
+                break;
+            }
+            self.active.push(LimboRes {
+                key,
+                target_id,
+                state: WatchState::new(target_id, Vec::new()),
+                ready: None,
+            });
+        }
+    }
+
+    /// Feeds a non-barrier response to every in-flight
+    /// resolution (each state ignores what is not addressed to
+    /// it), capturing outcomes as they emit. Returns the keys
+    /// whose targets the server removed with an error: a failed
+    /// resolution, settled by the caller as absent at once.
+    /// Failed resolutions leave `active` here.
+    fn feed(&mut self, response: &ListenResponse) -> Vec<String> {
+        let mut failed = Vec::new();
+        let mut index = 0;
+        while index < self.active.len() {
+            let res = &mut self.active[index];
+            match res.state.on_response(response.clone()) {
+                Some(WatchEvent::Snapshot(snapshot)) => {
+                    if res.ready.is_none() {
+                        res.ready = Some(
+                            snapshot
+                                .documents
+                                .into_iter()
+                                .find(|document| document.name == res.key),
+                        );
+                    }
+                    index += 1;
+                }
+                Some(WatchEvent::Removed(_)) => {
+                    failed.push(res.key.clone());
+                    self.active.remove(index);
+                }
+                None => index += 1,
+            }
+        }
+        failed
+    }
+
+    /// Settles resolutions at a barrier: every in-flight state
+    /// is fed the barrier, and resolutions whose outcome is
+    /// known (captured earlier, or emitted by this barrier)
+    /// complete. Returns (target id, key, outcome) for each
+    /// settled resolution; settled resolutions leave `active`.
+    fn settle(&mut self, barrier: &ListenResponse) -> Vec<(i32, String, Option<Document>)> {
+        let mut settled = Vec::new();
+        let mut index = 0;
+        while index < self.active.len() {
+            let outcome = {
+                let res = &mut self.active[index];
+                // Always advance the state through the barrier:
+                // it may carry newer state than the early capture
+                // (changes that arrived after the resolution first
+                // emitted would otherwise be discarded with the
+                // resolution). The capture is only the fallback
+                // for when the barrier produces nothing new.
+                match res.state.on_response(barrier.clone()) {
+                    Some(WatchEvent::Snapshot(snapshot)) => Some(
+                        snapshot
+                            .documents
+                            .into_iter()
+                            .find(|document| document.name == res.key),
+                    ),
+                    _ => res.ready.take(),
+                }
+            };
+            match outcome {
+                Some(outcome) => {
+                    let res = self.active.remove(index);
+                    settled.push((res.target_id, res.key, outcome));
+                }
+                None => index += 1,
+            }
+        }
+        settled
+    }
+
+    /// The stream ended: in-flight resolutions lose their wire
+    /// targets and restart from scratch on the next stream
+    /// (their candidates return to the queue, in order).
+    fn restart_session(&mut self) {
+        let mut keys: Vec<String> = self.active.drain(..).map(|res| res.key).collect();
+        keys.extend(self.waiting.drain(..));
+        self.waiting = keys.into();
+    }
+}
+
+/// Whether a response is a barrier at which limbo resolutions
+/// settle: a NO_CHANGE addressed stream-wide, to the query
+/// target, or to any limbo target. (A barrier addressed only
+/// to foreign targets completes nothing here.)
+fn is_settle_barrier(response: &ListenResponse, main_target_id: i32, limbo: &LimboTracker) -> bool {
+    match &response.response_type {
+        Some(ResponseType::TargetChange(change)) => {
+            change.target_change_type() == TargetChangeType::NoChange
+                && (change.target_ids.is_empty()
+                    || change.target_ids.contains(&main_target_id)
+                    || change
+                        .target_ids
+                        .iter()
+                        .any(|id| limbo.is_limbo_target(*id)))
+        }
+        _ => false,
+    }
+}
+
+/// Feeds a synthetic document-remove for `key` to the query
+/// state: the mechanism a settled limbo resolution uses to
+/// take its document out of the query view.
+fn feed_synthetic_remove(state: &mut WatchState, main_target_id: i32, key: &str) {
+    let _ = state.on_response(ListenResponse {
+        response_type: Some(ResponseType::DocumentRemove(
+            crate::google::firestore::v1::DocumentRemove {
+                document: key.to_string(),
+                removed_target_ids: vec![main_target_id],
+                read_time: None,
+            },
+        )),
+    });
+}
+
+/// Applies one settled limbo resolution to the query state
+/// (and, for store-backed watches, to the remote buffer the
+/// enclosing consistent point will flush): a confirmed
+/// document the query still matches is fed as a change; a
+/// confirmed document that no longer matches, and an absent
+/// document, are fed as removes. The store learns the
+/// confirmed document's latest state either way, and the
+/// absent document's tombstone.
+#[allow(clippy::too_many_arguments)]
+fn apply_limbo_outcome(
+    state: &mut WatchState,
+    query: Option<&Query>,
+    main_target_id: i32,
+    key: &str,
+    outcome: Option<Document>,
+    store_backed: bool,
+    buffer: &mut BTreeMap<String, Option<Document>>,
+) {
+    match outcome {
+        Some(document) => {
+            if store_backed {
+                buffer.insert(document.name.clone(), Some(document.clone()));
+            }
+            // Filter membership alone does not entitle the
+            // document to a place in the view: the query's
+            // semantics decide (filter match, order-field
+            // existence, ordering and limit). Evaluate the
+            // result window over the effective view with the
+            // confirmed document in it; the document enters only
+            // if it lands in the window, and view documents the
+            // recomputed window displaces leave with it. The
+            // offset is NOT re-applied: the view is the server's
+            // already paginated window and does not contain the
+            // documents the offset skipped, so offsetting it
+            // again would skip valid results a second time.
+            let (in_window, displaced) = match query {
+                Some(query) => {
+                    let view = state.effective_view();
+                    let mut candidates: Vec<Document> = view
+                        .iter()
+                        .filter(|candidate| candidate.name != document.name)
+                        .cloned()
+                        .collect();
+                    candidates.push(document.clone());
+                    let window: std::collections::BTreeSet<String> = query
+                        .without_offset()
+                        .evaluate(candidates)
+                        .into_iter()
+                        .map(|doc| doc.name)
+                        .collect();
+                    let displaced: Vec<String> = view
+                        .iter()
+                        .map(|doc| doc.name.clone())
+                        .filter(|name| name != &document.name && !window.contains(name))
+                        .collect();
+                    (window.contains(&document.name), displaced)
+                }
+                None => (true, Vec::new()),
+            };
+            if in_window {
+                let proto = crate::google::firestore::v1::Document {
+                    name: document.name.clone(),
+                    fields: crate::value::fields_to_proto(&document.fields),
+                    create_time: document.create_time.map(Into::into),
+                    update_time: document.update_time.map(Into::into),
+                };
+                let _ = state.on_response(ListenResponse {
+                    response_type: Some(ResponseType::DocumentChange(
+                        crate::google::firestore::v1::DocumentChange {
+                            document: Some(proto),
+                            target_ids: vec![main_target_id],
+                            removed_target_ids: Vec::new(),
+                        },
+                    )),
+                });
+            } else {
+                feed_synthetic_remove(state, main_target_id, key);
+            }
+            for name in &displaced {
+                feed_synthetic_remove(state, main_target_id, name);
+            }
+        }
+        None => {
+            if store_backed {
+                buffer.insert(key.to_string(), None);
+            }
+            feed_synthetic_remove(state, main_target_id, key);
+        }
     }
 }
 
@@ -2216,6 +2670,312 @@ mod tests {
         engine.store_remote_document(&versioned(10)).unwrap();
         reconcile_view_removals(&store_watch, &previous, &[], &buffer, &view_only, None);
         assert!(row(&engine).is_some(), "an unversioned point keeps the row");
+    }
+
+    fn limbo_change(target_id: i32, name: &str, n: i64) -> ListenResponse {
+        ListenResponse {
+            response_type: Some(ResponseType::DocumentChange(ProtoDocumentChange {
+                document: Some(doc(name, &[("n", Value::Integer(n))])),
+                target_ids: vec![target_id],
+                removed_target_ids: vec![],
+            })),
+        }
+    }
+
+    fn targeted_current(target_id: i32, seconds: i64) -> ListenResponse {
+        ListenResponse {
+            response_type: Some(ResponseType::TargetChange(TargetChange {
+                target_change_type: Type::Current as i32,
+                target_ids: vec![target_id],
+                resume_token: Vec::new(),
+                read_time: Some(prost_types::Timestamp { seconds, nanos: 0 }),
+                cause: None,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn limbo_tracker_pumps_with_cap_and_dedup() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        let mut limbo = LimboTracker::new();
+        limbo.enqueue(format!("{PREFIX}/notes/a"));
+        limbo.enqueue(format!("{PREFIX}/notes/a")); // duplicate: ignored
+        for index in 0..11 {
+            limbo.enqueue(format!("{PREFIX}/notes/d{index}"));
+        }
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        assert_eq!(limbo.active.len(), MAX_CONCURRENT_LIMBO_RESOLUTIONS);
+        assert_eq!(limbo.waiting.len(), 2);
+        let mut ids = std::collections::BTreeSet::new();
+        for _ in 0..MAX_CONCURRENT_LIMBO_RESOLUTIONS {
+            let request = receiver.recv().await.unwrap();
+            let Some(RequestTargetChange::AddTarget(target)) = request.target_change else {
+                panic!("expected an add-target request");
+            };
+            assert!(ids.insert(target.target_id), "ids must be unique");
+            assert_ne!(target.target_id, TARGET_ID);
+        }
+        // A stream end requeues the in-flight resolutions in
+        // order; they restart with fresh target ids.
+        limbo.restart_session();
+        assert!(limbo.active.is_empty());
+        assert_eq!(limbo.waiting.len(), 12);
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        let request = receiver.recv().await.unwrap();
+        let Some(RequestTargetChange::AddTarget(target)) = request.target_change else {
+            panic!("expected an add-target request");
+        };
+        assert!(!ids.contains(&target.target_id), "ids are not reused");
+    }
+
+    #[tokio::test]
+    async fn limbo_resolution_confirms_at_the_settle_barrier() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut limbo = LimboTracker::new();
+        let key = format!("{PREFIX}/notes/a");
+        limbo.enqueue(key.clone());
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        let target_id = limbo.active[0].target_id;
+        // The document target reports the document and becomes
+        // current with a read time: the outcome is captured but
+        // the resolution settles only at the barrier.
+        assert!(limbo
+            .feed(&limbo_change(target_id, "notes/a", 3))
+            .is_empty());
+        assert!(limbo.feed(&targeted_current(target_id, 5)).is_empty());
+        assert_eq!(limbo.active.len(), 1);
+        let settled = limbo.settle(&no_change_at(10));
+        assert_eq!(settled.len(), 1);
+        let (settled_id, settled_key, outcome) = settled.into_iter().next().unwrap();
+        assert_eq!(settled_id, target_id);
+        assert_eq!(settled_key, key);
+        let document = outcome.expect("confirmed outcome");
+        assert_eq!(document.fields.get("n"), Some(&Value::Integer(3)));
+        assert!(limbo.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn limbo_resolution_absent_and_failed() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut limbo = LimboTracker::new();
+        let key = format!("{PREFIX}/notes/a");
+        limbo.enqueue(key.clone());
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        let target_id = limbo.active[0].target_id;
+        // Current with no document reported: the resolution is
+        // absent, settled at the barrier.
+        assert!(limbo.feed(&targeted_current(target_id, 5)).is_empty());
+        let settled = limbo.settle(&no_change_at(10));
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].1, key);
+        assert!(settled[0].2.is_none());
+
+        // A target removed with an error fails the resolution:
+        // feed reports it and it leaves the active set at once.
+        limbo.enqueue(key.clone());
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        let target_id = limbo.active[0].target_id;
+        let removed = ListenResponse {
+            response_type: Some(ResponseType::TargetChange(TargetChange {
+                target_change_type: Type::Remove as i32,
+                target_ids: vec![target_id],
+                resume_token: Vec::new(),
+                read_time: None,
+                cause: Some(crate::google::rpc::Status {
+                    code: 7,
+                    message: "denied".to_string(),
+                    details: Vec::new(),
+                }),
+            })),
+        };
+        assert_eq!(limbo.feed(&removed), [key]);
+        assert!(limbo.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn limbo_settle_prefers_the_barriers_newer_state() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut limbo = LimboTracker::new();
+        let key = format!("{PREFIX}/notes/a");
+        limbo.enqueue(key.clone());
+        limbo.pump(&sender, "projects/p/databases/d").await;
+        let target_id = limbo.active[0].target_id;
+        // The outcome is captured early at n=1...
+        assert!(limbo
+            .feed(&limbo_change(target_id, "notes/a", 1))
+            .is_empty());
+        assert!(limbo.feed(&targeted_current(target_id, 5)).is_empty());
+        // ...then a newer change arrives before the barrier.
+        // Settlement must use the latest state, not the capture.
+        assert!(limbo
+            .feed(&limbo_change(target_id, "notes/a", 2))
+            .is_empty());
+        let settled = limbo.settle(&no_change_at(10));
+        assert_eq!(settled.len(), 1);
+        let document = settled
+            .into_iter()
+            .next()
+            .unwrap()
+            .2
+            .expect("confirmed outcome");
+        assert_eq!(document.fields.get("n"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn limbo_outcome_respects_the_query_window() {
+        let key_a = format!("{PREFIX}/notes/a");
+        let key_b = format!("{PREFIX}/notes/b");
+        let query = Query::new("notes").order_by(Order::asc("n")).limit(1);
+        let mut buffer: BTreeMap<String, Option<Document>> = BTreeMap::new();
+
+        // The view holds b(n=1) and a(n=2), a being the limbo
+        // candidate that stayed in the view. Confirming a must
+        // not keep it: the top-1 window over {a, b} is [b].
+        let mut state = WatchState::new(TARGET_ID, vec![Order::asc("n")]);
+        state.set_keep_restart_unconfirmed(true);
+        state.on_response(change("notes/b", &[("n", Value::Integer(1))]));
+        state.on_response(change("notes/a", &[("n", Value::Integer(2))]));
+        assert!(state.on_response(no_change_at(6)).is_some());
+        let confirmed = Document::from_proto(doc("notes/a", &[("n", Value::Integer(2))])).unwrap();
+        apply_limbo_outcome(
+            &mut state,
+            Some(&query),
+            TARGET_ID,
+            &key_a,
+            Some(confirmed),
+            false,
+            &mut buffer,
+        );
+        let Some(WatchEvent::Snapshot(snapshot)) = state.on_response(no_change_at(10)) else {
+            panic!("expected a snapshot at the barrier");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        assert_eq!(snapshot.documents[0].name, key_b);
+
+        // Confirming a(n=0) instead lands it in the window and
+        // displaces b.
+        let mut state = WatchState::new(TARGET_ID, vec![Order::asc("n")]);
+        state.set_keep_restart_unconfirmed(true);
+        state.on_response(change("notes/b", &[("n", Value::Integer(1))]));
+        state.on_response(change("notes/a", &[("n", Value::Integer(2))]));
+        assert!(state.on_response(no_change_at(6)).is_some());
+        let confirmed = Document::from_proto(doc("notes/a", &[("n", Value::Integer(0))])).unwrap();
+        apply_limbo_outcome(
+            &mut state,
+            Some(&query),
+            TARGET_ID,
+            &key_a,
+            Some(confirmed),
+            false,
+            &mut buffer,
+        );
+        let Some(WatchEvent::Snapshot(snapshot)) = state.on_response(no_change_at(10)) else {
+            panic!("expected a snapshot at the barrier");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        assert_eq!(snapshot.documents[0].name, key_a);
+        assert_eq!(
+            snapshot.documents[0].fields.get("n"),
+            Some(&Value::Integer(0))
+        );
+    }
+
+    #[test]
+    fn limbo_outcome_does_not_reapply_the_offset() {
+        let key_b = format!("{PREFIX}/notes/b");
+        // Collection a(n=1), b(n=2), c(n=3); the query orders by
+        // n with offset 1, so the server's view is [b, c] — a
+        // was skipped server-side and is not in the view.
+        let query = Query::new("notes").order_by(Order::asc("n")).offset(1);
+        let mut buffer: BTreeMap<String, Option<Document>> = BTreeMap::new();
+        let mut state = WatchState::new(TARGET_ID, vec![Order::asc("n")]);
+        state.set_keep_restart_unconfirmed(true);
+        state.on_response(change("notes/b", &[("n", Value::Integer(2))]));
+        state.on_response(change("notes/c", &[("n", Value::Integer(3))]));
+        assert!(state.on_response(no_change_at(6)).is_some());
+        // Confirming b unchanged must not shrink the view:
+        // re-applying the offset to [b, c] would skip b.
+        let confirmed = Document::from_proto(doc("notes/b", &[("n", Value::Integer(2))])).unwrap();
+        apply_limbo_outcome(
+            &mut state,
+            Some(&query),
+            TARGET_ID,
+            &key_b,
+            Some(confirmed),
+            false,
+            &mut buffer,
+        );
+        state.on_response(no_change_at(10));
+        // A later change makes the view observable: it must
+        // still hold b alongside c and the new d.
+        state.on_response(change("notes/d", &[("n", Value::Integer(4))]));
+        let Some(WatchEvent::Snapshot(snapshot)) = state.on_response(no_change_at(11)) else {
+            panic!("expected a snapshot at the barrier");
+        };
+        assert_eq!(snapshot.documents.len(), 3);
+        assert!(snapshot
+            .documents
+            .iter()
+            .any(|document| document.name == key_b));
+    }
+
+    #[test]
+    fn failed_limbo_outcome_waits_for_the_real_barrier() {
+        let mut state = watch();
+        state.set_keep_restart_unconfirmed(true);
+        state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
+        let Some(WatchEvent::Snapshot(snapshot)) = state.on_response(no_change_at(10)) else {
+            panic!("expected the initial snapshot");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        // The next remote event starts: b arrives, its barrier
+        // has not.
+        state.on_response(change("notes/b", &[("n", Value::Integer(2))]));
+        // a's resolution fails; the driver applies the absent
+        // outcome as a synthetic remove only. It must not
+        // publish b early at the old version.
+        let remove = ListenResponse {
+            response_type: Some(ResponseType::DocumentRemove(
+                crate::google::firestore::v1::DocumentRemove {
+                    document: format!("{PREFIX}/notes/a"),
+                    removed_target_ids: vec![TARGET_ID],
+                    read_time: None,
+                },
+            )),
+        };
+        assert!(
+            state.on_response(remove).is_none(),
+            "no premature snapshot at the old version"
+        );
+        // At the event's own barrier, both changes publish
+        // together at its read time.
+        let Some(WatchEvent::Snapshot(snapshot)) = state.on_response(no_change_at(11)) else {
+            panic!("expected a snapshot at the real barrier");
+        };
+        assert_eq!(snapshot.read_time, Some(Timestamp::new(11, 0)));
+        assert_eq!(snapshot.documents.len(), 1);
+        assert!(snapshot.documents[0].name.ends_with("/b"));
+    }
+
+    #[test]
+    fn settle_barrier_classification() {
+        let limbo = LimboTracker::new();
+        // Stream-wide and query-addressed barriers settle.
+        assert!(is_settle_barrier(&no_change_at(3), TARGET_ID, &limbo));
+        // A barrier addressed only to a foreign target does not.
+        let foreign = ListenResponse {
+            response_type: Some(ResponseType::TargetChange(TargetChange {
+                target_change_type: Type::NoChange as i32,
+                target_ids: vec![99],
+                resume_token: Vec::new(),
+                read_time: Some(prost_types::Timestamp {
+                    seconds: 3,
+                    nanos: 0,
+                }),
+                cause: None,
+            })),
+        };
+        assert!(!is_settle_barrier(&foreign, TARGET_ID, &limbo));
     }
 
     struct StubTokens;

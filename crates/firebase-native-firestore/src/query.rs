@@ -347,6 +347,18 @@ impl Query {
         query
     }
 
+    /// A clone with the offset removed. For reconciling a
+    /// watch's view locally: the view is the server's already
+    /// paginated window and does not contain the documents the
+    /// offset skipped, so re-applying the offset to it would
+    /// skip valid results a second time. The limit still
+    /// applies — the view's documents compete for its slots.
+    pub(crate) fn without_offset(&self) -> Query {
+        let mut query = self.clone();
+        query.offset = None;
+        query
+    }
+
     /// Evaluates the query locally over candidate documents
     /// (the caller supplies every document in the target
     /// collection, e.g. the local store's views): filters by
