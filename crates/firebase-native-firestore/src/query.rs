@@ -192,6 +192,76 @@ pub struct Query {
 }
 
 impl Query {
+    /// Whether a document satisfies this query's filters, under
+    /// local evaluation. Used by the spec-test harness now and by
+    /// local query evaluation over the store later; collection /
+    /// document path matching is the caller's job. Semantics
+    /// mirror the server's: comparisons use the Firestore total
+    /// order, and a missing field matches nothing except the
+    /// unary tests that explicitly accept it (none do — `IsNull`
+    /// requires an explicit null, as on the server).
+    // Staged for local query evaluation over the store;
+    // exercised today by the spec-test harness.
+    #[allow(dead_code)]
+    pub(crate) fn matches(&self, document: &crate::value::Document) -> bool {
+        self.filters.iter().all(|filter| match filter {
+            Filter::Field { field, op, value } => {
+                let Some(actual) = crate::mutation::lookup_path(&document.fields, field) else {
+                    return false;
+                };
+                use std::cmp::Ordering::*;
+                match op {
+                    FieldOp::Equal => actual.compare(value) == Equal,
+                    FieldOp::NotEqual => actual.compare(value) != Equal,
+                    FieldOp::LessThan => actual.compare(value) == Less,
+                    FieldOp::LessThanOrEqual => actual.compare(value) != Greater,
+                    FieldOp::GreaterThan => actual.compare(value) == Greater,
+                    FieldOp::GreaterThanOrEqual => actual.compare(value) != Less,
+                    FieldOp::In => match value {
+                        Value::Array(options) => {
+                            options.iter().any(|option| actual.compare(option) == Equal)
+                        }
+                        _ => false,
+                    },
+                    FieldOp::NotIn => match value {
+                        Value::Array(options) => {
+                            *actual != Value::Null
+                                && options
+                                    .iter()
+                                    .all(|option| actual.compare(option) != Equal)
+                        }
+                        _ => false,
+                    },
+                    FieldOp::ArrayContains => match actual {
+                        Value::Array(items) => {
+                            items.iter().any(|item| item.compare(value) == Equal)
+                        }
+                        _ => false,
+                    },
+                    FieldOp::ArrayContainsAny => match (actual, value) {
+                        (Value::Array(items), Value::Array(options)) => items
+                            .iter()
+                            .any(|item| options.iter().any(|o| item.compare(o) == Equal)),
+                        _ => false,
+                    },
+                }
+            }
+            Filter::Unary { field, op } => {
+                let actual = crate::mutation::lookup_path(&document.fields, field);
+                match op {
+                    UnaryOp::IsNull => matches!(actual, Some(Value::Null)),
+                    UnaryOp::IsNotNull => matches!(actual, Some(value) if *value != Value::Null),
+                    UnaryOp::IsNan => {
+                        matches!(actual, Some(Value::Double(v)) if v.is_nan())
+                    }
+                    UnaryOp::IsNotNan => {
+                        matches!(actual, Some(value) if !matches!(value, Value::Double(v) if v.is_nan()))
+                    }
+                }
+            }
+        })
+    }
+
     /// Starts a query on a collection (its ID, not a full path:
     /// `notes`, not `spaces/personal/notes` — for subcollections pass
     /// the parent document to `run_query`).

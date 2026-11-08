@@ -52,6 +52,8 @@ mod mutation;
 mod path;
 mod proxy;
 mod query;
+#[cfg(test)]
+mod spec_runner;
 mod store;
 mod value;
 mod write;

@@ -126,6 +126,16 @@ pub(crate) struct WatchState {
     ever_emitted: bool,
     current_received: bool,
     resume_token: Option<Vec<u8>>,
+    /// Seeded documents the (re)added target has not yet
+    /// re-confirmed. On a fresh add (no resume token), documents
+    /// the server does not resend are deleted from the view at
+    /// the first consistent point: the reference client's
+    /// synthesized deletes. Empty unless seeded with synthesis.
+    unconfirmed: std::collections::BTreeSet<String>,
+    /// The highest consistent-point read time accepted so far,
+    /// whether or not it produced a snapshot: consistent points
+    /// behind it belong to a reverted stream.
+    highest_consistent_read_time: Option<Timestamp>,
 }
 
 impl WatchState {
@@ -139,7 +149,30 @@ impl WatchState {
             ever_emitted: false,
             current_received: false,
             resume_token: None,
+            unconfirmed: std::collections::BTreeSet::new(),
+            highest_consistent_read_time: None,
         }
+    }
+
+    /// Seeds the view with documents known before the target is
+    /// (re)added — the local store's cached view, once watches are
+    /// store-backed. The seeded set becomes the diff baseline, so
+    /// the first snapshot reports changes relative to it. With
+    /// `synthesize_deletes` (a fresh add without a resume token),
+    /// seeded documents the server never re-confirms are removed
+    /// at the first consistent point; on a resumed add the server
+    /// sends only deltas, so nothing is synthesized.
+    // Staged for store-backed watches; exercised today by the
+    // spec-test harness.
+    #[allow(dead_code)]
+    pub(crate) fn seed_view(&mut self, documents: Vec<Document>, synthesize_deletes: bool) {
+        for document in &documents {
+            self.docs.insert(document.name.clone(), document.clone());
+            if synthesize_deletes {
+                self.unconfirmed.insert(document.name.clone());
+            }
+        }
+        self.emitted = documents;
     }
 
     /// The latest resume token reported by the server, if any.
@@ -156,6 +189,13 @@ impl WatchState {
         match response.response_type? {
             ResponseType::DocumentChange(change) => {
                 let document = change.document?;
+                if change.removed_target_ids.contains(&self.target_id)
+                    || self.applies_to_me(&change.target_ids)
+                {
+                    // Any word about this document confirms its
+                    // state; it needs no synthesized delete.
+                    self.unconfirmed.remove(&document.name);
+                }
                 if change.removed_target_ids.contains(&self.target_id) {
                     self.pending.insert(document.name.clone(), None);
                 } else if self.applies_to_me(&change.target_ids) {
@@ -175,12 +215,14 @@ impl WatchState {
             }
             ResponseType::DocumentDelete(delete) => {
                 if self.applies_to_me(&delete.removed_target_ids) {
+                    self.unconfirmed.remove(&delete.document);
                     self.pending.insert(delete.document, None);
                 }
                 None
             }
             ResponseType::DocumentRemove(remove) => {
                 if self.applies_to_me(&remove.removed_target_ids) {
+                    self.unconfirmed.remove(&remove.document);
                     self.pending.insert(remove.document, None);
                 }
                 None
@@ -221,6 +263,7 @@ impl WatchState {
     fn reset_view(&mut self) {
         self.docs.clear();
         self.pending.clear();
+        self.unconfirmed.clear();
         self.current_received = false;
         self.resume_token = None;
     }
@@ -246,13 +289,26 @@ impl WatchState {
                     return None;
                 }
                 self.current_received = true;
+                // Becoming current (again) is itself news for the
+                // listener: the next consistent point raises a
+                // snapshot even when no document changed, matching
+                // the reference client after a resume/reconnect.
+                self.ever_emitted = false;
                 // CURRENT marks the target current, but a snapshot
                 // may only be emitted at a consistent point: if the
                 // read_time is omitted the target is not at one yet,
                 // so keep the pending changes and wait for the
                 // following consistent NO_CHANGE.
                 match change.read_time {
-                    Some(read_time) => self.emit(Some(Timestamp::from(read_time))),
+                    Some(read_time) => {
+                        let read_time = Timestamp::from(read_time);
+                        if self.is_stale(&read_time) {
+                            None
+                        } else {
+                            self.accept_consistent_point(&read_time);
+                            self.emit(Some(read_time), true)
+                        }
+                    }
                     None => None,
                 }
             }
@@ -270,22 +326,70 @@ impl WatchState {
                 None
             }
             TargetChangeType::NoChange => {
-                // A read_time with no target IDs is the stream-wide
-                // consistent point; only meaningful after CURRENT.
-                if !self.current_received || change.read_time.is_none() {
-                    return None;
-                }
                 if !applies {
                     return None;
                 }
-                self.emit(change.read_time.map(Timestamp::from))
+                let read_time = Timestamp::from(change.read_time?);
+                if self.is_stale(&read_time) {
+                    // The stream reverted behind the highest
+                    // accepted version: nothing to deliver, and
+                    // pending changes stay pending.
+                    return None;
+                }
+                self.accept_consistent_point(&read_time);
+                // A targeted NO_CHANGE is a consistent point only
+                // once CURRENT arrived. A stream-wide one (no
+                // target IDs) may also deliver pending changes
+                // before CURRENT, but an empty initial snapshot
+                // still waits for CURRENT (`allow_empty`).
+                if !self.current_received && !change.target_ids.is_empty() {
+                    return None;
+                }
+                self.emit(Some(read_time), self.current_received)
             }
         }
     }
 
-    /// Applies pending changes and, if the view changed (or nothing
-    /// was ever emitted), produces the next snapshot.
-    fn emit(&mut self, read_time: Option<Timestamp>) -> Option<WatchEvent> {
+    /// Whether a consistent point predates the highest accepted
+    /// one (the stream reverted to an older version).
+    fn is_stale(&self, read_time: &Timestamp) -> bool {
+        self.highest_consistent_read_time
+            .as_ref()
+            .is_some_and(|last| {
+                read_time.seconds < last.seconds
+                    || (read_time.seconds == last.seconds && read_time.nanos < last.nanos)
+            })
+    }
+
+    /// Records a consistent point as accepted: the stale
+    /// watermark advances even when the point produces no
+    /// snapshot (an unchanged barrier still moves the stream's
+    /// version forward).
+    fn accept_consistent_point(&mut self, read_time: &Timestamp) {
+        let dominated = self
+            .highest_consistent_read_time
+            .as_ref()
+            .is_some_and(|last| {
+                last.seconds > read_time.seconds
+                    || (last.seconds == read_time.seconds && last.nanos >= read_time.nanos)
+            });
+        if !dominated {
+            self.highest_consistent_read_time = Some(*read_time);
+        }
+    }
+
+    /// Applies pending changes and, if the view changed (or
+    /// nothing was ever emitted and an empty snapshot is allowed
+    /// at this point), produces the next snapshot.
+    fn emit(&mut self, read_time: Option<Timestamp>, allow_empty: bool) -> Option<WatchEvent> {
+        // First consistent point of a freshly added target:
+        // seeded documents the server never re-confirmed are
+        // deleted from the view (synthesized deletes).
+        if self.current_received && !self.unconfirmed.is_empty() {
+            for name in std::mem::take(&mut self.unconfirmed) {
+                self.docs.remove(&name);
+            }
+        }
         for (name, change) in std::mem::take(&mut self.pending) {
             match change {
                 Some(doc) => {
@@ -298,7 +402,7 @@ impl WatchState {
         }
         let ordered = self.ordered_documents();
         let changes = diff_snapshots(&self.emitted, &ordered);
-        if self.ever_emitted && changes.is_empty() {
+        if changes.is_empty() && (self.ever_emitted || !allow_empty) {
             return None;
         }
         self.ever_emitted = true;
@@ -439,7 +543,25 @@ fn map_rpc_status(code: i32, message: &str) -> Error {
         7 => Error::PermissionDenied(message.to_string()),
         3 => Error::InvalidArgument(message.to_string()),
         _ => Error::Rpc {
-            code: code.to_string(),
+            // Store the canonical code *name*, consistent with
+            // `map_status` (numeric strings here once made
+            // downstream code-name comparisons silently miss).
+            code: match code {
+                1 => "Canceled",
+                2 => "Unknown",
+                4 => "DeadlineExceeded",
+                6 => "AlreadyExists",
+                8 => "ResourceExhausted",
+                9 => "FailedPrecondition",
+                10 => "Aborted",
+                11 => "OutOfRange",
+                12 => "Unimplemented",
+                13 => "Internal",
+                14 => "Unavailable",
+                15 => "DataLoss",
+                _ => "Unknown",
+            }
+            .to_string(),
             message: message.to_string(),
         },
     }
@@ -737,14 +859,21 @@ mod tests {
     }
 
     #[test]
-    fn initial_snapshot_only_at_current() {
+    fn initial_empty_snapshot_waits_for_current() {
         let mut state = watch();
+        // A stream-wide consistent point with nothing pending
+        // does not raise the initial (empty) snapshot before
+        // CURRENT.
+        assert!(state.on_response(no_change_at(1)).is_none());
+        // Pending changes, however, are delivered at a
+        // stream-wide consistent point even before CURRENT: the
+        // reference client's aggregator behavior, exercised by
+        // the spec suite ("Does not synthesize deletes..." raises
+        // its first snapshot at a bare barrier).
         assert!(state
             .on_response(change("notes/a", &[("n", Value::Integer(1))]))
             .is_none());
-        // NO_CHANGE before CURRENT must not emit.
-        assert!(state.on_response(no_change_at(1)).is_none());
-        let event = state.on_response(target_change(Type::Current, Some((2, 0)), b"t1"));
+        let event = state.on_response(no_change_at(2));
         let Some(WatchEvent::Snapshot(snapshot)) = event else {
             panic!("expected snapshot, got {event:?}");
         };
@@ -752,7 +881,78 @@ mod tests {
         assert_eq!(snapshot.changes.len(), 1);
         assert_eq!(snapshot.changes[0].kind, DocumentChangeKind::Added);
         assert_eq!(snapshot.read_time, Some(Timestamp::new(2, 0)));
+        // Becoming CURRENT still raises a snapshot (with an empty
+        // diff): the listener learns the target is current.
+        let event = state.on_response(target_change(Type::Current, Some((3, 0)), b"t1"));
+        assert!(matches!(event, Some(WatchEvent::Snapshot(_))));
         assert_eq!(state.resume_token(), Some(b"t1".as_slice()));
+    }
+
+    fn seed_doc(name: &str) -> crate::value::Document {
+        crate::value::Document::from_proto(doc(name, &[("n", Value::Integer(1))]))
+            .expect("seed document")
+    }
+
+    #[test]
+    fn seeded_fresh_view_synthesizes_deletes_for_unconfirmed() {
+        let mut state = watch();
+        state.seed_view(vec![seed_doc("notes/a"), seed_doc("notes/b")], true);
+        // The server re-confirms only notes/a.
+        state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
+        state.on_response(target_change(Type::Current, None, b""));
+        let event = state.on_response(no_change_at(5));
+        let Some(WatchEvent::Snapshot(snapshot)) = event else {
+            panic!("expected snapshot, got {event:?}");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        assert!(snapshot.changes.iter().any(|change| {
+            change.kind == DocumentChangeKind::Removed && change.document.name.ends_with("notes/b")
+        }));
+    }
+
+    #[test]
+    fn seeded_resumed_view_keeps_unconfirmed() {
+        let mut state = watch();
+        state.seed_view(vec![seed_doc("notes/a")], false);
+        state.on_response(target_change(Type::Current, None, b""));
+        let event = state.on_response(no_change_at(5));
+        let Some(WatchEvent::Snapshot(snapshot)) = event else {
+            panic!("expected snapshot, got {event:?}");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        assert!(snapshot.changes.is_empty());
+    }
+
+    #[test]
+    fn accepted_barrier_advances_the_stale_watermark() {
+        let mut state = watch();
+        state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
+        state.on_response(target_change(Type::Current, None, b""));
+        assert!(state.on_response(no_change_at(10)).is_some());
+        // An unchanged barrier at 20 emits nothing, but its
+        // version is still accepted...
+        assert!(state.on_response(no_change_at(20)).is_none());
+        // ...so a change followed by a barrier at 15 is stale and
+        // must not be delivered.
+        state.on_response(change("notes/b", &[("n", Value::Integer(2))]));
+        assert!(state.on_response(no_change_at(15)).is_none());
+        // The pending change arrives at the next fresh barrier.
+        let event = state.on_response(no_change_at(25));
+        let Some(WatchEvent::Snapshot(snapshot)) = event else {
+            panic!("expected snapshot, got {event:?}");
+        };
+        assert_eq!(snapshot.documents.len(), 2);
+    }
+
+    #[test]
+    fn reverted_barrier_is_ignored() {
+        let mut state = watch();
+        state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
+        state.on_response(target_change(Type::Current, None, b""));
+        assert!(state.on_response(no_change_at(10)).is_some());
+        // A consistent point behind the delivered snapshot's
+        // version delivers nothing.
+        assert!(state.on_response(no_change_at(5)).is_none());
     }
 
     #[test]
