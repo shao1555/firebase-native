@@ -24,10 +24,13 @@ use std::collections::BTreeMap;
 use firebase_native_core::Error;
 use serde_json::{Map, Value as Json};
 
+use crate::google::firestore::v1::listen_request::TargetChange as RequestTargetChange;
 use crate::google::firestore::v1::listen_response::ResponseType;
+use crate::google::firestore::v1::target::ResumeType;
 use crate::google::firestore::v1::target_change::TargetChangeType;
 use crate::google::firestore::v1::{
-    DocumentChange as ProtoDocumentChange, DocumentDelete, ListenResponse, TargetChange,
+    DocumentChange as ProtoDocumentChange, DocumentDelete, ExistenceFilter, ListenResponse, Target,
+    TargetChange,
 };
 use crate::listen::{DocumentChange, DocumentChangeKind, Snapshot, WatchEvent, WatchState};
 use crate::query::{FieldOp, Filter, Order, Query, UnaryOp};
@@ -214,11 +217,21 @@ struct Harness {
     target_id: i32,
     unlistened: bool,
     expected_view: BTreeMap<String, Fields>,
-    /// Whether the server acknowledged the current target
-    /// (`watchAck`): the spec harness raises snapshots at global
-    /// barriers for acknowledged targets without an explicit
-    /// CURRENT step.
-    acked: bool,
+    /// Resume tokens held per target ID, synced from the watch
+    /// state after every response (the token store a store-backed
+    /// client keeps in its targets table). Compared against
+    /// `expectedState` and against what the real add-target
+    /// request construction would send.
+    target_tokens: std::collections::HashMap<i32, String>,
+    /// Set when the watch state restarted on an existence filter
+    /// whose count *matched* the local view: a supported case
+    /// regressing, which must fail, not skip.
+    unexpected_restart: bool,
+    /// Entity changes fed since the last emitted snapshot, by
+    /// relative key: the pending overlay on `view`, used to
+    /// size the watch state's view independently of its filter
+    /// handling when an existence filter arrives.
+    pending_view: BTreeMap<String, bool>,
     /// The highest global snapshot version this case has
     /// delivered; a barrier behind it is a reverted stream and
     /// is ignored (the version timeline is global to the case).
@@ -266,7 +279,9 @@ impl Harness {
             target_id: 0,
             unlistened: false,
             expected_view: BTreeMap::new(),
-            acked: false,
+            target_tokens: std::collections::HashMap::new(),
+            unexpected_restart: false,
+            pending_view: BTreeMap::new(),
             max_barrier: 0,
             query: None,
             current_query_sig: String::new(),
@@ -282,14 +297,77 @@ impl Harness {
         }
     }
 
+    /// Builds the add-target request for the active listen
+    /// through the driver's real construction and verifies the
+    /// resume token it would send is the one the harness holds
+    /// for the target.
+    fn check_readd_token(&self) -> Result<(), String> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        let request = crate::listen::add_target_request(
+            "projects/test-project/databases/test-db",
+            &Target {
+                target_id: self.target_id,
+                ..Default::default()
+            },
+            state,
+            true,
+        );
+        let sent = match request.target_change {
+            Some(RequestTargetChange::AddTarget(target)) => match target.resume_type {
+                Some(ResumeType::ResumeToken(bytes)) => Some(bytes),
+                _ => None,
+            },
+            _ => None,
+        };
+        let held = self
+            .target_tokens
+            .get(&self.target_id)
+            .map(|token| token.as_bytes().to_vec());
+        if sent == held {
+            Ok(())
+        } else {
+            Err(format!(
+                "add-target would send token {sent:?}, harness holds {held:?}"
+            ))
+        }
+    }
+
+    /// Records a resume token seen outside a fed response
+    /// (targeted snapshots are bookkeeping in the spec model).
+    fn note_token(&mut self, token: &[u8]) {
+        if token.is_empty() {
+            return;
+        }
+        if let Some(state) = self.state.as_mut() {
+            state.note_resume_token(token);
+        }
+        self.target_tokens
+            .insert(self.target_id, String::from_utf8_lossy(token).into_owned());
+    }
+
     fn feed(&mut self, response: ListenResponse, emitted: &mut Vec<Emitted>) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        match state.on_response(response) {
+        let event = state.on_response(response);
+        // The held token always mirrors the watch state's, so a
+        // state that drops tokens is caught by the comparisons.
+        match state.resume_token().map(|token| token.to_vec()) {
+            Some(bytes) => {
+                self.target_tokens
+                    .insert(self.target_id, String::from_utf8_lossy(&bytes).into_owned());
+            }
+            None => {
+                self.target_tokens.remove(&self.target_id);
+            }
+        }
+        match event {
             Some(WatchEvent::Snapshot(snapshot)) => {
                 self.delivered_queries
                     .insert(self.current_query_sig.clone());
+                self.pending_view.clear();
                 self.feed_snapshots += 1;
                 if self.fresh_seed && self.feed_snapshots == 1 {
                     // Synthesized deletes leave the local store as
@@ -315,7 +393,7 @@ impl Harness {
                 emitted.push(Emitted::Snapshot(snapshot));
             }
             Some(WatchEvent::Restart) => {
-                emitted.push(Emitted::Error(-1));
+                self.unexpected_restart = true;
             }
             Some(WatchEvent::Removed(error)) => {
                 // A clean removal is not a snapshot event in the
@@ -460,11 +538,16 @@ fn run_case(case: &Json) -> Outcome {
                         .iter()
                         .map(|document| (key_of(&document.name), document.clone()))
                         .collect();
+                    if let Some(token) = harness.target_tokens.get(&target_id).cloned() {
+                        state.restore_resume_token(token.into_bytes());
+                    }
                     harness.state = Some(state);
                     harness.target_id = target_id;
                     harness.unlistened = false;
-                    harness.acked = false;
                     harness.listen_saw_token = false;
+                    if let Err(message) = harness.check_readd_token() {
+                        return Outcome::Failed(at(message));
+                    }
                     harness.current_query_sig =
                         serde_json::to_string(&query_json).unwrap_or_default();
                     if harness
@@ -503,15 +586,7 @@ fn run_case(case: &Json) -> Outcome {
                     }
                     harness.unlistened = true;
                 }
-                "watchAck" => {
-                    let ids: Vec<i64> = value
-                        .as_array()
-                        .map(|items| items.iter().filter_map(Json::as_i64).collect())
-                        .unwrap_or_default();
-                    if ids.is_empty() || ids.contains(&(harness.target_id as i64)) {
-                        harness.acked = true;
-                    }
-                }
+                "watchAck" => {}
                 "watchEntity" if harness.unlistened => {
                     // Updates addressed to an inactive target are
                     // ignored by the client.
@@ -530,6 +605,7 @@ fn run_case(case: &Json) -> Outcome {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let addressed = targets.is_empty() || targets.contains(&harness.target_id);
                     for doc in value
                         .get("docs")
                         .and_then(Json::as_array)
@@ -548,6 +624,12 @@ fn run_case(case: &Json) -> Outcome {
                         }
                         let key = doc.get("key").and_then(Json::as_str).unwrap_or_default();
                         let version = doc.get("version").and_then(Json::as_i64).unwrap_or(0);
+                        if addressed {
+                            harness.pending_view.insert(
+                                key.to_string(),
+                                doc.get("value").is_some_and(|v| !v.is_null()),
+                            );
+                        }
                         // The local store never lets a document
                         // revert: a remote event older than the
                         // cached version is dropped entirely.
@@ -690,6 +772,13 @@ fn run_case(case: &Json) -> Outcome {
                     if !token.is_empty() {
                         harness.listen_saw_token = true;
                     }
+                    // A targeted snapshot is bookkeeping in the
+                    // spec model (resume token / version for that
+                    // target); it raises no event by itself, but
+                    // its token is recorded.
+                    if target_ids.contains(&harness.target_id) {
+                        harness.note_token(&token);
+                    }
                     if target_ids.is_empty() {
                         // Global barrier. A version behind the
                         // highest one already delivered belongs to
@@ -710,9 +799,95 @@ fn run_case(case: &Json) -> Outcome {
                             );
                         }
                     }
-                    // A targeted snapshot is bookkeeping in the
-                    // spec model (resume token / version for that
-                    // target); it raises no event by itself.
+                }
+                "watchFilter" => {
+                    if value.get("bloomFilter").is_some() {
+                        return Outcome::Skipped(
+                            "bloom filter existence check (limbo) not modeled".to_string(),
+                        );
+                    }
+                    // Supported vs. unsupported is decided from
+                    // the harness's own view (emitted documents
+                    // plus the pending overlay), independently of
+                    // the implementation's restart signal: a count
+                    // that differs needs limbo / re-run
+                    // orchestration (skipped); a matching count is
+                    // supported, and a restart there fails below.
+                    let mut view: std::collections::BTreeSet<&String> =
+                        harness.view.keys().collect();
+                    for (key, present) in &harness.pending_view {
+                        if *present {
+                            view.insert(key);
+                        } else {
+                            view.remove(key);
+                        }
+                    }
+                    let expected_count = value
+                        .get("count")
+                        .and_then(Json::as_i64)
+                        .or_else(|| {
+                            value
+                                .get("keys")
+                                .and_then(Json::as_array)
+                                .map(|keys| keys.len() as i64)
+                        })
+                        .unwrap_or(0);
+                    if expected_count != view.len() as i64 {
+                        return Outcome::Skipped(
+                            "existence-filter mismatch (limbo / re-run orchestration) not modeled"
+                                .to_string(),
+                        );
+                    }
+                    // The pre-bloom form lists the server's known
+                    // keys; the client only consumes their count.
+                    let target_id = value
+                        .get("targetIds")
+                        .and_then(Json::as_array)
+                        .and_then(|ids| ids.first())
+                        .and_then(Json::as_i64)
+                        .or_else(|| value.get("targetId").and_then(Json::as_i64))
+                        .unwrap_or(0) as i32;
+                    let count = value
+                        .get("count")
+                        .and_then(Json::as_i64)
+                        .or_else(|| {
+                            value
+                                .get("keys")
+                                .and_then(Json::as_array)
+                                .map(|keys| keys.len() as i64)
+                        })
+                        .unwrap_or(0) as i32;
+                    harness.feed(
+                        ListenResponse {
+                            response_type: Some(ResponseType::Filter(ExistenceFilter {
+                                target_id,
+                                count,
+                                unchanged_names: None,
+                            })),
+                        },
+                        &mut emitted,
+                    );
+                }
+                "watchStreamClose" => {
+                    let code = value
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(Json::as_i64)
+                        .unwrap_or(0) as i32;
+                    if harness.state.is_some() {
+                        if matches!(code, 3 | 5 | 7) {
+                            // Terminal: the watch ends with an error.
+                            emitted.push(Emitted::Error(code));
+                            harness.state = None;
+                        } else if let Err(message) = harness.check_readd_token() {
+                            // Reconnect and resume: the driver
+                            // keeps the same watch state across
+                            // streams, so the token and view are
+                            // inherently preserved; verify the
+                            // re-add request would send the token.
+                            return Outcome::Failed(at(message));
+                        }
+                    }
                 }
                 "watchRemove" => {
                     let target_ids: Vec<i32> = value
@@ -758,6 +933,12 @@ fn run_case(case: &Json) -> Outcome {
             }
         }
 
+        if harness.unexpected_restart {
+            return Outcome::Failed(at(
+                "unexpected restart on a matching existence filter".to_string()
+            ));
+        }
+
         // Compare this step's expected snapshot events, if any.
         if let Some(expected_events) = step.get("expectedSnapshotEvents") {
             let expected_events = expected_events.as_array().cloned().unwrap_or_default();
@@ -794,6 +975,27 @@ fn run_case(case: &Json) -> Outcome {
                     return Outcome::Failed(at(
                         "expected active targets, harness has none".to_string()
                     ));
+                }
+                // The held resume token for our target is part of
+                // the expected state: compare it exactly.
+                if let Some(targets) = active.as_object() {
+                    if let Some(entry) = targets.get(&harness.target_id.to_string()) {
+                        let expected_token = entry
+                            .get("resumeToken")
+                            .and_then(Json::as_str)
+                            .unwrap_or("");
+                        let held_token = harness
+                            .target_tokens
+                            .get(&harness.target_id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if expected_token != held_token {
+                            return Outcome::Failed(at(format!(
+                                "resume token mismatch: expected {expected_token:?}, \
+                                 client holds {held_token:?}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -981,11 +1183,10 @@ fn relisten_event_generation_ignores_expectations() {
     assert!(matches!(run_case(&delivered), Outcome::Failed(_)));
 }
 
-/// Runs the listen suite and asserts every non-skipped case
-/// passes; prints the coverage summary.
-#[test]
-fn listen_spec_suite() {
-    let suite = load_suite("listen_spec_test.json");
+/// Runs one suite, prints its coverage summary, and asserts
+/// every non-skipped case passes.
+fn assert_suite(file: &str, label: &str) {
+    let suite = load_suite(file);
     let mut passed = 0;
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
@@ -997,7 +1198,7 @@ fn listen_spec_suite() {
         }
     }
     println!(
-        "listen spec suite: {passed} passed, {} skipped, {} failed (of {})",
+        "{label} spec suite: {passed} passed, {} skipped, {} failed (of {})",
         skipped.len(),
         failures.len(),
         suite.len()
@@ -1010,9 +1211,24 @@ fn listen_spec_suite() {
     }
     assert!(
         failures.is_empty(),
-        "{} listen spec cases failed",
+        "{} {label} spec cases failed",
         failures.len()
     );
+}
+
+#[test]
+fn listen_spec_suite() {
+    assert_suite("listen_spec_test.json", "listen");
+}
+
+#[test]
+fn existence_filter_spec_suite() {
+    assert_suite("existence_filter_spec_test.json", "existence filter");
+}
+
+#[test]
+fn resume_token_spec_suite() {
+    assert_suite("resume_token_spec_test.json", "resume token");
 }
 
 /// Vendoring integrity: every suite file parses and the case
