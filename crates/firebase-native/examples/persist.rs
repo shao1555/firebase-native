@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use firebase_native::auth::Auth;
-use firebase_native::firestore::{Fields, Firestore, Value};
+use firebase_native::firestore::{FieldOp, Fields, Filter, Firestore, Query, Value};
 use firebase_native::{App, FirebaseOptions};
 
 fn required(name: &str) -> Result<String, String> {
@@ -276,6 +276,102 @@ async fn main() -> ExitCode {
             .await
             .map_err(|err| format!("watch cleanup wait failed: {err}"))?;
         println!("WATCH LIVE CHECK PASSED");
+
+        // 6. Limbo resolution: cache a document through the
+        // persistent client, delete it on the server behind its
+        // back, then watch its collection. The tokenless watch
+        // seeds the document from the store and delivers it in
+        // the cache snapshot; the server never re-confirms it,
+        // so it must leave the delivered snapshots once its
+        // document-target resolution settles as absent — it
+        // must not linger as a stale cache entry.
+        let limbo_id = format!("{doc_id}-limbo");
+        let limbo_path = format!("notes/{limbo_id}");
+        let mut fields = Fields::new();
+        fields.insert("spaceId".to_string(), Value::String(space_id.clone()));
+        fields.insert(
+            "content".to_string(),
+            Value::String("limbo candidate".to_string()),
+        );
+        online
+            .create_document("notes", Some(&limbo_id), fields)
+            .await
+            .map_err(|err| format!("limbo setup create failed: {err}"))?;
+        let cached = persistent
+            .get_document(&limbo_path)
+            .await
+            .map_err(|err| format!("limbo cache get failed: {err}"))?;
+        if cached.is_none() {
+            return Err("limbo document was not cached".to_string());
+        }
+        online
+            .delete_document(&limbo_path)
+            .await
+            .map_err(|err| format!("limbo server delete failed: {err}"))?;
+        // The query is scoped to the space, as the project's
+        // rules require (an unscoped collection query is denied:
+        // rules are not filters).
+        let mut listener = persistent
+            .watch_query(
+                "",
+                Query::new("notes").filter(Filter::Field {
+                    field: "spaceId".to_string(),
+                    op: FieldOp::Equal,
+                    value: Value::String(space_id.clone()),
+                }),
+            )
+            .await
+            .map_err(|err| format!("limbo watch failed: {err}"))?;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(30), listener.next())
+            .await
+            .map_err(|_| "timed out waiting for the limbo cache snapshot".to_string())?
+            .ok_or("limbo watch ended before the cache snapshot")?
+            .map_err(|err| format!("limbo cache snapshot failed: {err}"))?;
+        if !first
+            .documents
+            .iter()
+            .any(|document| document.name.ends_with(&limbo_id))
+        {
+            return Err("cache snapshot does not hold the limbo document".to_string());
+        }
+        println!("limbo: cache snapshot holds the server-deleted document");
+        // Poke the collection so the stream produces barriers:
+        // the resolution settles at one.
+        let poke_id = format!("{doc_id}-poke");
+        let mut fields = Fields::new();
+        fields.insert("spaceId".to_string(), Value::String(space_id.clone()));
+        fields.insert("content".to_string(), Value::String("poke".to_string()));
+        online
+            .create_document("notes", Some(&poke_id), fields)
+            .await
+            .map_err(|err| format!("limbo poke create failed: {err}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut resolved = false;
+        while std::time::Instant::now() < deadline && !resolved {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await {
+                Ok(Some(Ok(snapshot))) => {
+                    resolved = !snapshot
+                        .documents
+                        .iter()
+                        .any(|document| document.name.ends_with(&limbo_id));
+                }
+                Ok(Some(Err(err))) => {
+                    return Err(format!("limbo watch snapshot failed: {err}"));
+                }
+                Ok(None) => return Err("limbo watch ended before the resolution".to_string()),
+                Err(_) => {}
+            }
+        }
+        if !resolved {
+            return Err("limbo document never left the snapshots".to_string());
+        }
+        println!("limbo: resolution removed the server-deleted document");
+        drop(listener);
+        online
+            .delete_document(&format!("notes/{poke_id}"))
+            .await
+            .map_err(|err| format!("limbo poke cleanup failed: {err}"))?;
+        println!("LIMBO LIVE CHECK PASSED");
         println!("PERSIST LIVE CHECK PASSED");
         Ok::<(), String>(())
     };

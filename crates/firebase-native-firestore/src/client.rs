@@ -267,6 +267,7 @@ impl Firestore {
             target,
             orders,
             store_watch,
+            Some(query),
         ))
     }
 
@@ -304,6 +305,7 @@ impl Firestore {
             target,
             Vec::new(),
             store_watch,
+            None,
         ))
     }
 
