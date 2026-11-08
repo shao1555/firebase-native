@@ -20,5 +20,11 @@ tokio.workspace = true
 name = "smoke"
 path = "examples/smoke.rs"
 
+[[example]]
+name = "storage"
+path = "examples/storage.rs"
+
+
 [dev-dependencies]
 async-trait.workspace = true
+reqwest.workspace = true

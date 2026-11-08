@@ -7,7 +7,10 @@ license.workspace = true
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Cloud Storage for Firebase client for firebase-native (placeholder until P3)."
+description = "Cloud Storage for Firebase client for firebase-native."
 
 [dependencies]
 firebase-native-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true

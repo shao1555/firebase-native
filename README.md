@@ -4,12 +4,12 @@ A pure-Rust Firebase client for native applications.
 
 `firebase-native` implements the Firebase client protocols directly —
 Authentication over the Identity Toolkit REST API, Firestore over gRPC,
-and (from P3) Cloud Storage for Firebase over its JSON API — instead of
+and Cloud Storage for Firebase over its JSON API — instead of
 wrapping the official Firebase C++ SDK. Pure Rust means it builds
 natively for every target Rust supports, including Windows on ARM64,
 for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 
-> Status: **P2 complete** — Auth sign-in/refresh, Firestore unary
+> Status: **P3 complete** — Auth sign-in/refresh, Firestore unary
 > CRUD, the Listen stream (reconnect/resume, production limbo
 > resolution), the local store with offline persistence and
 > latency compensation, the Write stream, local query evaluation
@@ -18,7 +18,8 @@ for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 > recovery, existence filter, resume token, limbo) pass against
 > the vendored firebase-ios-sdk corpus (see
 > `crates/firebase-native-firestore/tests/spec_tests/`). Storage
-> lands in P3.
+> (simple and resumable uploads, download, metadata, list,
+> delete) is implemented over the JSON API and live-verified.
 
 ## Crates
 
@@ -28,7 +29,7 @@ for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 | `firebase-native-core` | `App`, `FirebaseOptions`, the shared `Error` type, the `TokenProvider` trait, and the `CredentialStore` trait. |
 | `firebase-native-auth` | Identity Toolkit REST client: custom token, email/password, anonymous and IdP sign-in; automatic token refresh; session restore via `CredentialStore`. |
 | `firebase-native-firestore` | Firestore gRPC client with a hand-written public `Value` model (generated protobuf types are never exposed). |
-| `firebase-native-storage` | Cloud Storage for Firebase (placeholder until P3). |
+| `firebase-native-storage` | Cloud Storage for Firebase over the JSON API: simple (media/multipart) and resumable uploads, download, metadata, listing and delete. |
 
 ## Design points
 
@@ -100,7 +101,7 @@ the vendored googleapis protos (pinned at commit
   recovery; spec-test runner and the listen/write/persistence/offline
   suites; listen-through-store, local query evaluation, the public
   FieldValue sentinel API, and production limbo resolution. ✅
-- **P3** — Storage implementation.
+- **P3** — Storage implementation. ✅
 - **P4** — Integration into a production native client app.
 
 ## License

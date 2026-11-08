@@ -7,7 +7,8 @@
 //!   API, with automatic refresh and shell-owned session persistence.
 //! - [`firestore`] — Cloud Firestore over gRPC, with a hand-written
 //!   public value model (generated protobuf types are never exposed).
-//! - [`storage`] — Cloud Storage for Firebase (placeholder until P3).
+//! - [`storage`] — Cloud Storage for Firebase over its JSON API, with
+//!   simple and resumable uploads.
 //!
 //! Unlike a wrapper around the Firebase C++ SDK, this implementation
 //! is pure Rust, so it builds natively for every target Rust supports
