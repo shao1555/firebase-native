@@ -35,20 +35,36 @@ layers, so the runner covers the **watch layer** today:
   query's path and filters (`Query::matches`), and synthesized
   deletes for documents a freshly added target never
   re-confirms (`WatchState::seed_view`).
+- Client lifecycle steps are modeled directly: `restart` and
+  `shutdown` drop streams, listeners and session bookkeeping
+  while persisted state (the local store, the document cache,
+  target resume tokens) survives; `clearPersistence` wipes it.
+  Mutation queues are per-user: `changeUser` switches which
+  queued batches are visible to listeners and settled by
+  acknowledgements. Resume-token persistence follows the
+  reference rules: a target-specific (CURRENT) token persists
+  at the next barrier, while a global snapshot's token
+  persists only once it is at least five minutes ahead of the
+  last persisted snapshot version.
 - Cases needing machinery that does not exist yet are reported
   as **skipped with a reason**, never silently passed: multiple
-  clients/tabs, multiple concurrent targets, query limits,
-  bloom existence filters and mismatch limbo resolution,
-  snapshots-in-sync listeners, field transforms, and
-  restart/shutdown/primary-election behavior.
+  clients/tabs (including primary election), multiple
+  concurrent targets, query limits, bloom existence filters
+  and mismatch limbo resolution, snapshots-in-sync listeners,
+  and field transforms.
 
-Current results: **listen** (66 cases) 26 passed / 40 skipped /
-0 failed — skips are multi-client / multi-tab scenarios (28),
-snapshots-in-sync listeners (4), restart (3), multiple
-concurrent targets (3), limbo existence filters (2), query
-limit (1). **Write** (59 cases) 38 passed / 21 skipped /
-0 failed — skips are multi-client scenarios (15),
-restart/shutdown (4) and field transforms (2).
+Current results: **listen** (66 cases) 29 passed / 37 skipped /
+0 failed — skips are multi-client / multi-tab scenarios,
+snapshots-in-sync listeners, multiple concurrent targets,
+limbo existence filters and a query limit case.
+**Persistence** (13 cases) 8 passed / 5 skipped / 0 failed —
+the skips are all multi-client primary-lease scenarios; the
+single-client cases cover persisted mutations re-sent after
+restart, per-user mutation queues across uid switches and
+restarts, persisted mutations visible to listeners, and
+persisted remote documents. **Write** (59 cases) 39 passed /
+20 skipped / 0 failed — skips are multi-client scenarios (18)
+and field transforms (2).
 **Offline** (10 cases) 9 passed / 1 skipped / 0 failed: the
 harness models the reference online-state tracker (a fresh
 client is Unknown and its queries wait; a successful watch
