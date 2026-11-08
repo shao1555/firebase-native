@@ -205,6 +205,19 @@ pub(crate) enum Mutation {
 }
 
 impl Mutation {
+    /// A copy of this mutation with its transforms removed:
+    /// the literal part only.
+    pub(crate) fn without_transforms(&self) -> Mutation {
+        let mut mutation = self.clone();
+        match &mut mutation {
+            Mutation::Set { transforms, .. } | Mutation::Patch { transforms, .. } => {
+                transforms.clear();
+            }
+            Mutation::Delete { .. } => {}
+        }
+        mutation
+    }
+
     /// The relative document path this mutation touches.
     pub(crate) fn path(&self) -> &str {
         match self {

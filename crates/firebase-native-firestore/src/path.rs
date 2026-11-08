@@ -136,6 +136,109 @@ pub(crate) fn encode_field_path_segment(name: &str) -> String {
     out
 }
 
+/// Validates the syntax of a field path a *write* may target
+/// and returns its parsed segments. Each segment must be a
+/// simple name (a letter or underscore, then letters, digits
+/// and underscores — the form [`encode_field_path_segment`]
+/// leaves unquoted) or a backtick-quoted string whose closing
+/// backtick ends the segment, with non-empty content and no
+/// unescaped backtick inside; reserved names (`__…__`, e.g.
+/// `__name__`) are rejected. [`parse_field_path`] alone is a
+/// permissive lookup parser: it accepts empty paths, empty
+/// segments and malformed quoting, so a write API must not
+/// enqueue a path it has not run through this first — the
+/// malformed write would otherwise succeed locally and be
+/// rejected by the server after queueing.
+pub(crate) fn validate_field_path(path: &str) -> Result<Vec<String>> {
+    let invalid =
+        |reason: &str| Error::InvalidArgument(format!("invalid field path `{path}`: {reason}"));
+    if path.is_empty() {
+        return Err(invalid("the path is empty"));
+    }
+    // Split into raw (still-quoted) segments, respecting
+    // backtick quoting and backslash escapes inside it.
+    let mut raw: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = path.chars();
+    loop {
+        match chars.next() {
+            None => {
+                raw.push(current);
+                break;
+            }
+            Some('`') if !quoted && current.is_empty() => {
+                quoted = true;
+                current.push('`');
+            }
+            Some('`') if quoted => {
+                quoted = false;
+                current.push('`');
+            }
+            Some('\\') if quoted => {
+                current.push('\\');
+                match chars.next() {
+                    Some(escaped) => current.push(escaped),
+                    None => return Err(invalid("a dangling escape ends the path")),
+                }
+            }
+            Some('.') if !quoted => {
+                raw.push(std::mem::take(&mut current));
+            }
+            Some(c) => current.push(c),
+        }
+    }
+    if quoted {
+        return Err(invalid("a backtick quote is not closed"));
+    }
+    for segment in &raw {
+        if segment.is_empty() {
+            return Err(invalid("a segment is empty"));
+        }
+        if !valid_field_segment(segment) {
+            return Err(invalid("a segment is malformed"));
+        }
+    }
+    let segments = parse_field_path(path);
+    for segment in &segments {
+        if segment.len() > 3 && segment.starts_with("__") && segment.ends_with("__") {
+            return Err(invalid("a segment uses a reserved name"));
+        }
+    }
+    Ok(segments)
+}
+
+/// Whether one raw (still-quoted, if quoted) field-path
+/// segment is well-formed; see [`validate_field_path`].
+fn valid_field_segment(segment: &str) -> bool {
+    if let Some(rest) = segment.strip_prefix('`') {
+        let Some(inner) = rest.strip_suffix('`') else {
+            return false;
+        };
+        if inner.is_empty() {
+            return false;
+        }
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '`' => return false,
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            }
+        }
+        true
+    } else {
+        let mut chars = segment.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+}
+
 /// Splits a Firestore field path into its segments. Segments are
 /// dot-separated; a segment wrapped in backticks may itself contain
 /// dots, and inside backticks a backslash escapes the next character

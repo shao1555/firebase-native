@@ -145,6 +145,47 @@ pub struct GeoPoint {
     pub longitude: f64,
 }
 
+/// One field's new content in a `set_document_with` /
+/// `update_document_with` call: either a literal [`Value`] or a
+/// sentinel asking the server to compute the field's new value
+/// from what it holds.
+///
+/// Sentinels are addressed by field path (the map key in
+/// [`crate::FieldValues`]), so a nested field is written as
+/// `"stats.count"` rather than by nesting inside a `Value::Map`
+/// — a sentinel inside a map value is not supported, matching
+/// the official SDKs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    /// A literal value, written as-is.
+    Value(Value),
+    /// The field is set to the server's commit time. In a local
+    /// (unacknowledged) view it reads as `Null` until the write
+    /// is acknowledged, when the exact time lands.
+    ServerTimestamp,
+    /// The field is removed from the document. Only meaningful
+    /// where fields can be removed individually (an update, or
+    /// a merge set); a non-merge set rejects it.
+    Delete,
+    /// The field's numeric value is increased by the operand
+    /// (a missing or non-numeric field is treated as 0). The
+    /// operand must be a number.
+    Increment(Value),
+    /// Every element not already in the field's array is
+    /// appended (a missing or non-array field starts empty).
+    ArrayUnion(Vec<Value>),
+    /// Every occurrence of the elements is removed from the
+    /// field's array (a missing or non-array field becomes an
+    /// empty array).
+    ArrayRemove(Vec<Value>),
+}
+
+impl From<Value> for FieldValue {
+    fn from(value: Value) -> Self {
+        FieldValue::Value(value)
+    }
+}
+
 /// A Firestore value. Mirrors the `Value` oneof of the Firestore API
 /// without exposing the generated protobuf type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -308,7 +308,11 @@ impl PersistenceEngine {
         for batch in self.store.peek_batches(usize::MAX)? {
             for mutation in &batch.mutations {
                 if mutation.path() == relative_path {
-                    current = mutation.apply_to_local(current);
+                    current = if mutation.transforms().is_empty() {
+                        mutation.apply_to_local(current)
+                    } else {
+                        self.apply_local_with_estimates(&batch, mutation, current, &name)?
+                    };
                     if let Some(document) = current.as_mut() {
                         if document.name.is_empty() {
                             document.name = name.clone();
@@ -318,6 +322,83 @@ impl PersistenceEngine {
             }
         }
         Ok(current)
+    }
+
+    /// Applies one transform-bearing mutation to the local view
+    /// with frozen estimates. An increment is not idempotent: if
+    /// the remote base moves under a queued increment — the
+    /// watch delivers the write's own server result before the
+    /// acknowledgement lands, say — reapplying the mutation to
+    /// the new base would count it twice. So the first
+    /// application freezes each *increment* field's resulting
+    /// value against its batch in the store, and later
+    /// applications replay the mutation's literal part on the
+    /// current base but substitute the frozen values for the
+    /// increment fields. The remaining transforms are recomputed
+    /// against the current base on every application (see the
+    /// loop). The estimates persist across restarts and are
+    /// dropped when the batch settles, when the fold installs
+    /// the server's exact transform results into the base.
+    fn apply_local_with_estimates(
+        &self,
+        batch: &crate::store::MutationBatch,
+        mutation: &Mutation,
+        current: Option<Document>,
+        full_name: &str,
+    ) -> Result<Option<Document>> {
+        let frozen = self.store.transform_estimates(batch.id, full_name)?;
+        let Some(computed) = mutation.apply_to_local(current.clone()) else {
+            // A patch against a missing base produces nothing,
+            // frozen or not.
+            return Ok(None);
+        };
+        // The literal part replays on the current base; applied
+        // to the same base it cannot come back empty where the
+        // full application succeeded.
+        let mut result = mutation
+            .without_transforms()
+            .apply_to_local(current)
+            .unwrap_or_else(|| computed.clone());
+        let mut fresh: Vec<(String, crate::value::Value)> = Vec::new();
+        for transform in mutation.transforms() {
+            // Only the non-idempotent transform freezes: an
+            // increment must not count twice when its own result
+            // lands in the base early. The array transforms are
+            // idempotent — union and removal settle to the same
+            // outcome over any base — so they are recomputed
+            // against the current base and keep tracking remote
+            // changes while the batch is pending; a server
+            // timestamp's local estimate (Null) does not depend
+            // on the base at all.
+            let freezes = matches!(transform.kind, crate::mutation::TransformKind::Increment(_));
+            let frozen_value = if freezes {
+                frozen
+                    .iter()
+                    .find(|(path, _)| path == &transform.path)
+                    .map(|(_, value)| value.clone())
+            } else {
+                None
+            };
+            let is_frozen = frozen_value.is_some();
+            match frozen_value.or_else(|| {
+                crate::mutation::lookup_path(&computed.fields, &transform.path).cloned()
+            }) {
+                Some(value) => {
+                    if freezes && !is_frozen {
+                        fresh.push((transform.path.clone(), value.clone()));
+                    }
+                    crate::mutation::set_path(&mut result.fields, &transform.path, value);
+                }
+                None => {
+                    crate::mutation::delete_path(&mut result.fields, &transform.path);
+                }
+            }
+        }
+        if !fresh.is_empty() {
+            self.store
+                .put_transform_estimates(batch.id, full_name, &fresh)?;
+        }
+        Ok(Some(result))
     }
 
     /// Whether any queued mutation touches `relative_path`.
@@ -555,6 +636,184 @@ mod tests {
             exists: None,
             transforms: Vec::new(),
         }
+    }
+
+    fn remote_doc_at(path: &str, n: i64, update_seconds: i64) -> Document {
+        let mut fields = Fields::new();
+        fields.insert("n".to_string(), Value::Integer(n));
+        Document {
+            name: format!("projects/p/databases/d/documents/{path}"),
+            fields,
+            create_time: None,
+            update_time: Some(crate::value::Timestamp {
+                seconds: update_seconds,
+                nanos: 0,
+            }),
+        }
+    }
+
+    /// A queued increment is applied once, not once per base:
+    /// when the watch caches the write's own server result
+    /// before the acknowledgement lands, the local view keeps
+    /// the frozen estimate instead of counting the increment
+    /// again — and the fold then installs the exact result.
+    #[test]
+    fn queued_increment_is_not_reapplied_to_its_own_result() {
+        let engine = test_engine();
+        engine
+            .store_remote_document(&remote_doc_at("notes/a", 10, 10))
+            .unwrap();
+        let batch_id = engine
+            .store()
+            .enqueue_batch(&[Mutation::Patch {
+                path: "notes/a".to_string(),
+                fields: Fields::new(),
+                // Transform paths are not mask paths (the
+                // mutation model's disjointness invariant).
+                mask: Vec::new(),
+                exists: Some(true),
+                transforms: vec![crate::mutation::FieldTransform {
+                    path: "n".to_string(),
+                    kind: crate::mutation::TransformKind::Increment(Value::Integer(1)),
+                }],
+            }])
+            .unwrap();
+        let view = engine.local_document("notes/a").unwrap().unwrap();
+        assert_eq!(view.fields.get("n"), Some(&Value::Integer(11)));
+
+        // The watch caches the write's own result (n = 11) while
+        // the batch is still queued: the view must stay 11, not
+        // reapply the increment to 12.
+        engine
+            .store_remote_document(&remote_doc_at("notes/a", 11, 20))
+            .unwrap();
+        let view = engine.local_document("notes/a").unwrap().unwrap();
+        assert_eq!(view.fields.get("n"), Some(&Value::Integer(11)));
+
+        // Settlement: the fold installs the exact server result
+        // and drops the queue entry and its estimates; the view
+        // now comes from the base alone.
+        let batch = engine
+            .store()
+            .peek_batches(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(batch.id, batch_id);
+        engine
+            .fold_acknowledgement_with_results(
+                &batch,
+                crate::value::Timestamp {
+                    seconds: 20,
+                    nanos: 0,
+                },
+                &[vec![Value::Integer(11)]],
+            )
+            .unwrap();
+        assert_eq!(engine.store().batch_count().unwrap(), 0);
+        assert!(engine
+            .store()
+            .transform_estimates(batch_id, "projects/p/databases/d/documents/notes/a")
+            .unwrap()
+            .is_empty());
+        let view = engine.local_document("notes/a").unwrap().unwrap();
+        assert_eq!(view.fields.get("n"), Some(&Value::Integer(11)));
+    }
+
+    fn remote_tags(path: &str, tags: &[&str], update_seconds: i64) -> Document {
+        let mut fields = Fields::new();
+        fields.insert(
+            "tags".to_string(),
+            Value::Array(
+                tags.iter()
+                    .map(|tag| Value::String(tag.to_string()))
+                    .collect(),
+            ),
+        );
+        Document {
+            name: format!("projects/p/databases/d/documents/{path}"),
+            fields,
+            create_time: None,
+            update_time: Some(crate::value::Timestamp {
+                seconds: update_seconds,
+                nanos: 0,
+            }),
+        }
+    }
+
+    fn tags_of(document: &Document) -> Vec<String> {
+        match document.fields.get("tags") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    Value::String(tag) => tag.clone(),
+                    other => panic!("unexpected tag value: {other:?}"),
+                })
+                .collect(),
+            other => panic!("unexpected tags field: {other:?}"),
+        }
+    }
+
+    fn array_patch(path: &str, kind: crate::mutation::TransformKind) -> Mutation {
+        Mutation::Patch {
+            path: path.to_string(),
+            fields: Fields::new(),
+            mask: Vec::new(),
+            exists: Some(true),
+            transforms: vec![crate::mutation::FieldTransform {
+                path: "tags".to_string(),
+                kind,
+            }],
+        }
+    }
+
+    /// The array transforms are idempotent, so they are NOT
+    /// frozen: while the batch is pending they recompute over
+    /// the current remote base and keep tracking its changes.
+    #[test]
+    fn queued_array_transforms_track_the_remote_base() {
+        let engine = test_engine();
+        // Union: base [a], pending union [b] reads [a, b]; when
+        // the base moves to [a, c] the view becomes [a, c, b] —
+        // not the frozen [a, b].
+        engine
+            .store_remote_document(&remote_tags("notes/a", &["a"], 10))
+            .unwrap();
+        engine
+            .store()
+            .enqueue_batch(&[array_patch(
+                "notes/a",
+                crate::mutation::TransformKind::ArrayUnion(vec![Value::String("b".to_string())]),
+            )])
+            .unwrap();
+        let view = engine.local_document("notes/a").unwrap().unwrap();
+        assert_eq!(tags_of(&view), ["a", "b"]);
+        engine
+            .store_remote_document(&remote_tags("notes/a", &["a", "c"], 20))
+            .unwrap();
+        let view = engine.local_document("notes/a").unwrap().unwrap();
+        assert_eq!(tags_of(&view), ["a", "c", "b"]);
+
+        // Remove: base [a, c], pending remove [a] reads [c];
+        // when the base gains d the view becomes [c, d].
+        engine
+            .store_remote_document(&remote_tags("notes/b", &["a", "c"], 10))
+            .unwrap();
+        engine
+            .store()
+            .enqueue_batch(&[array_patch(
+                "notes/b",
+                crate::mutation::TransformKind::ArrayRemove(vec![Value::String("a".to_string())]),
+            )])
+            .unwrap();
+        let view = engine.local_document("notes/b").unwrap().unwrap();
+        assert_eq!(tags_of(&view), ["c"]);
+        engine
+            .store_remote_document(&remote_tags("notes/b", &["a", "c", "d"], 20))
+            .unwrap();
+        let view = engine.local_document("notes/b").unwrap().unwrap();
+        assert_eq!(tags_of(&view), ["c", "d"]);
     }
 
     #[test]

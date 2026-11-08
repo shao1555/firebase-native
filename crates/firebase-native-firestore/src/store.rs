@@ -87,6 +87,13 @@ impl LocalStore {
                  resume_token BLOB NOT NULL,
                  snapshot_seconds INTEGER,
                  snapshot_nanos INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS transform_estimates (
+                 batch_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 field_path TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (batch_id, name, field_path)
              );",
         )
         .map_err(store_error)?;
@@ -184,6 +191,12 @@ impl LocalStore {
         transaction
             .execute("DELETE FROM mutations WHERE id = ?1", params![batch_id])
             .map_err(store_error)?;
+        transaction
+            .execute(
+                "DELETE FROM transform_estimates WHERE batch_id = ?1",
+                params![batch_id],
+            )
+            .map_err(store_error)?;
         transaction.commit().map_err(store_error)?;
         Ok(())
     }
@@ -253,12 +266,79 @@ impl LocalStore {
         Ok(batches)
     }
 
-    /// Removes an acknowledged (or server-rejected) batch.
+    /// Removes an acknowledged (or server-rejected) batch,
+    /// together with its frozen transform estimates.
     pub(crate) fn remove_batch(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute("DELETE FROM mutations WHERE id = ?1", params![id])
             .map_err(store_error)?;
+        conn.execute(
+            "DELETE FROM transform_estimates WHERE batch_id = ?1",
+            params![id],
+        )
+        .map_err(store_error)?;
         Ok(())
+    }
+
+    // --- transform estimates -------------------------------------
+
+    /// Records frozen local estimates for a batch's increment
+    /// fields on one document. An increment is not idempotent,
+    /// so the value its first local application produced is
+    /// kept until the batch settles (see the engine's local
+    /// view); the rows die with the batch (the
+    /// acknowledged-batch commit and `remove_batch` delete
+    /// them), because the fold installs the server's exact
+    /// results into the base.
+    pub(crate) fn put_transform_estimates(
+        &self,
+        batch_id: i64,
+        name: &str,
+        estimates: &[(String, crate::value::Value)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        for (field_path, value) in estimates {
+            let json = serde_json::to_string(value)
+                .map_err(|e| Error::Other(format!("estimate encode: {e}")))?;
+            conn.execute(
+                "INSERT INTO transform_estimates (batch_id, name, field_path, value)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(batch_id, name, field_path)
+                 DO UPDATE SET value = excluded.value",
+                params![batch_id, name, field_path, json],
+            )
+            .map_err(store_error)?;
+        }
+        Ok(())
+    }
+
+    /// The frozen transform estimates of one batch for one
+    /// document, as (field path, value) pairs.
+    pub(crate) fn transform_estimates(
+        &self,
+        batch_id: i64,
+        name: &str,
+    ) -> Result<Vec<(String, crate::value::Value)>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                "SELECT field_path, value FROM transform_estimates
+                 WHERE batch_id = ?1 AND name = ?2",
+            )
+            .map_err(store_error)?;
+        let rows = statement
+            .query_map(params![batch_id, name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(store_error)?;
+        let mut estimates = Vec::new();
+        for row in rows {
+            let (field_path, json) = row.map_err(store_error)?;
+            let value: crate::value::Value = serde_json::from_str(&json)
+                .map_err(|e| Error::Other(format!("estimate decode: {e}")))?;
+            estimates.push((field_path, value));
+        }
+        Ok(estimates)
     }
 
     /// Number of queued batches.

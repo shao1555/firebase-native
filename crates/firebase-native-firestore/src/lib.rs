@@ -63,7 +63,12 @@ pub use client::{Firestore, ListDocumentsResult};
 pub use listen::{DocumentChange, DocumentChangeKind, Listener, Snapshot};
 pub use path::{collection_path_of, document_id_of, is_collection_path, is_document_path};
 pub use query::{FieldOp, Filter, Order, Query, UnaryOp};
-pub use value::{Document, GeoPoint, Timestamp, Value};
+pub use value::{Document, FieldValue, GeoPoint, Timestamp, Value};
 
 /// A document's fields: an ordered map of field name to [`Value`].
 pub type Fields = std::collections::BTreeMap<String, Value>;
+
+/// The fields of a `set_document_with` / `update_document_with`
+/// call: an ordered map of field *path* to [`FieldValue`], so
+/// nested fields are addressed as `"stats.count"`.
+pub type FieldValues = std::collections::BTreeMap<String, FieldValue>;
