@@ -49,6 +49,17 @@ concurrent targets (3), limbo existence filters (2), query
 limit (1). **Write** (59 cases) 38 passed / 21 skipped /
 0 failed — skips are multi-client scenarios (15),
 restart/shutdown (4) and field transforms (2).
+**Offline** (10 cases) 9 passed / 1 skipped / 0 failed: the
+harness models the reference online-state tracker (a fresh
+client is Unknown and its queries wait; a successful watch
+message makes it Online; from Unknown a single stream failure
+goes Offline, from Online a first failure arms the
+online-state timeout and a second failure — or the timeout
+firing via `runTimer` — goes Offline; removing the last
+listener resets the tracker to Unknown). Going Offline
+resolves the active listen from cache, and a listen registered
+while Offline (or with the network disabled) resolves
+immediately. The skipped case needs limbo documents.
 **Resume token** (2 cases) 2 passed / 0 skipped. **Existence
 filter** (26 cases) 2 passed / 24 skipped / 0 failed: the
 matching-count cases pass through `WatchState`'s filter

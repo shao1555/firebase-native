@@ -210,17 +210,37 @@ enum RemoteUpdate {
     Absent(String, Option<i64>),
 }
 
+/// The client's online state, as the reference online-state
+/// tracker maintains it: a fresh client is `Unknown` (queries
+/// wait), a successful watch message makes it `Online`, and
+/// stream failures or the online-state timeout make it
+/// `Offline` (queries resolve from cache).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnlineState {
+    Unknown,
+    Online,
+    Offline,
+}
+
 /// What the harness emitted for one step.
 enum Emitted {
     /// A snapshot from the watch state itself.
     Snapshot(Snapshot),
     /// A snapshot the local layer re-raises without the watch
-    /// state (a new listener's initial view, the offline
-    /// re-raise). Generated purely from harness state; on steps
-    /// that assert nothing, the spec corpus tolerates these
-    /// (valid upstream cases leave them unasserted), while steps
-    /// that do assert — even `[]` — compare them strictly.
+    /// state (a new listener's initial view). Generated purely
+    /// from harness state; on steps that assert nothing, the
+    /// spec corpus tolerates these (valid upstream cases leave
+    /// them unasserted), while steps that do assert — even `[]`
+    /// — compare them strictly.
     Pseudo(Snapshot),
+    /// A snapshot raised by an online-state transition: going
+    /// Offline resolving the active listen from cache, or a
+    /// listen registered while Offline resolving immediately.
+    /// Unlike `Pseudo`, these are checked strictly on every
+    /// step — a premature or duplicate offline event on a step
+    /// that expects none fails the case, because transition
+    /// timing is exactly what the offline suite pins down.
+    Offline(Snapshot),
     /// A snapshot composed by the local layer in write mode: the
     /// store's remote base overlaid with the queued mutations —
     /// the production client's local view. Its cache/pending
@@ -282,6 +302,15 @@ struct Harness {
     resumable_targets: std::collections::HashSet<i32>,
     had_listen: bool,
     online: bool,
+    /// The online-state tracker's state (listen mode): see
+    /// [`OnlineState`]. Stream failures count toward the
+    /// offline transition; the online-state timeout is armed by
+    /// a first failure while `Online`.
+    online_state: OnlineState,
+    stream_failures: u32,
+    offline_timeout_armed: bool,
+    /// Whether the active listen has emitted any snapshot.
+    listen_delivered: bool,
     /// The last emitted snapshot's documents, by relative key:
     /// the active listen's view.
     view: BTreeMap<String, Document>,
@@ -371,6 +400,10 @@ impl Harness {
             resumable_targets: std::collections::HashSet::new(),
             had_listen: false,
             online: true,
+            online_state: OnlineState::Unknown,
+            stream_failures: 0,
+            offline_timeout_armed: false,
+            listen_delivered: false,
             view: BTreeMap::new(),
             cache: BTreeMap::new(),
             fresh_seed: false,
@@ -445,7 +478,53 @@ impl Harness {
             .insert(self.target_id, String::from_utf8_lossy(token).into_owned());
     }
 
+    /// Transitions the online-state tracker to Offline and
+    /// resolves the active listen from cache: a delivered
+    /// listen re-raises its view unchanged (the fromCache flag
+    /// flips), an undelivered one raises its initial view.
+    fn go_offline(&mut self, emitted: &mut Vec<Emitted>) {
+        self.online_state = OnlineState::Offline;
+        self.stream_failures = 0;
+        self.offline_timeout_armed = false;
+        if self.write_mode || self.state.is_none() || self.unlistened {
+            return;
+        }
+        let documents: Vec<Document> = self.view.values().cloned().collect();
+        let changes = if self.listen_delivered {
+            Vec::new()
+        } else {
+            documents
+                .iter()
+                .enumerate()
+                .map(|(index, document)| DocumentChange {
+                    kind: DocumentChangeKind::Added,
+                    document: document.clone(),
+                    old_index: None,
+                    new_index: Some(index),
+                })
+                .collect()
+        };
+        emitted.push(Emitted::Offline(Snapshot {
+            documents,
+            changes,
+            read_time: None,
+        }));
+        self.listen_delivered = true;
+    }
+
+    /// A successful watch message: the client is Online, and
+    /// any offline progress (failure count, armed timeout) is
+    /// reset — a successful message delays offline status.
+    fn note_watch_success(&mut self) {
+        if !self.write_mode {
+            self.online_state = OnlineState::Online;
+            self.stream_failures = 0;
+            self.offline_timeout_armed = false;
+        }
+    }
+
     fn feed(&mut self, response: ListenResponse, emitted: &mut Vec<Emitted>) {
+        self.note_watch_success();
         // A NO_CHANGE barrier's read time confirms every
         // committed write at or below it, and the barrier is
         // where streamed confirmations surface as events.
@@ -1171,8 +1250,18 @@ fn run_case(case: &Json) -> Outcome {
                 }
                 "userListen" => {
                     if harness.state.is_some() && !harness.unlistened {
-                        return Outcome::Skipped("multiple concurrent targets".to_string());
+                        // A second concurrent listen is only
+                        // modeled when the client is offline (or
+                        // the network is disabled): the new query
+                        // then resolves from cache and no further
+                        // steps address the superseded target.
+                        let offline_now = !harness.write_mode
+                            && (harness.online_state == OnlineState::Offline || !harness.online);
+                        if !offline_now {
+                            return Outcome::Skipped("multiple concurrent targets".to_string());
+                        }
                     }
+                    harness.listen_delivered = false;
                     let target_id =
                         value.get("targetId").and_then(Json::as_i64).unwrap_or(0) as i32;
                     let query_json = value.get("query").cloned().unwrap_or(Json::Null);
@@ -1283,10 +1372,57 @@ fn run_case(case: &Json) -> Outcome {
                             }));
                         }
                     }
+                    if !harness.write_mode
+                        && (harness.online_state == OnlineState::Offline || !harness.online)
+                        && !emitted
+                            .iter()
+                            .any(|event| matches!(event, Emitted::Pseudo(_)))
+                    {
+                        // A listen registered while the client is
+                        // offline (or the network is disabled)
+                        // resolves immediately from cache.
+                        let documents: Vec<Document> = harness
+                            .cache
+                            .iter()
+                            .filter_map(|(key, (document, _))| {
+                                let document = document.as_ref()?;
+                                (path_matches(&query_path, key) && query.matches(document))
+                                    .then(|| document.clone())
+                            })
+                            .collect();
+                        let changes = documents
+                            .iter()
+                            .enumerate()
+                            .map(|(index, document)| DocumentChange {
+                                kind: DocumentChangeKind::Added,
+                                document: document.clone(),
+                                old_index: None,
+                                new_index: Some(index),
+                            })
+                            .collect();
+                        emitted.push(Emitted::Offline(Snapshot {
+                            documents,
+                            changes,
+                            read_time: None,
+                        }));
+                    }
                     harness.had_listen = true;
                 }
                 "changeUser" => {
-                    return Outcome::Skipped("user change not modeled".to_string());
+                    if harness.write_mode {
+                        // Mutation queues are per-user; not
+                        // modeled.
+                        return Outcome::Skipped("user change not modeled".to_string());
+                    }
+                    // In a listen-only case a credential change
+                    // restarts the streams but does not by
+                    // itself change the online state: network
+                    // availability dominates.
+                }
+                "watchReset" => {
+                    return Outcome::Skipped(
+                        "watch reset (limbo resolution) not modeled".to_string(),
+                    );
                 }
                 "userSet" => {
                     let args = value.as_array().cloned().unwrap_or_default();
@@ -1385,8 +1521,43 @@ fn run_case(case: &Json) -> Outcome {
                         harness.resumable_targets.insert(harness.target_id);
                     }
                     harness.unlistened = true;
+                    if !harness.write_mode {
+                        // Removing the last listener resets the
+                        // online-state tracker to Unknown: the
+                        // next listen starts the cycle over (it
+                        // neither resolves from cache nor counts
+                        // earlier stream failures).
+                        harness.online_state = OnlineState::Unknown;
+                        harness.stream_failures = 0;
+                        harness.offline_timeout_armed = false;
+                    }
                 }
-                "watchAck" => {}
+                "watchAck" => {
+                    // The stream accepted the target: a
+                    // successful watch message.
+                    harness.note_watch_success();
+                }
+                "runTimer" => {
+                    // Fires the online-state timeout (the only
+                    // timer the harness models): a client that
+                    // never connected goes Offline, as does an
+                    // Online client whose stream failure armed
+                    // the timeout.
+                    let fires = match &value {
+                        Json::String(name) => name == "online_state_timeout" || name == "all",
+                        Json::Array(items) => items.iter().any(|item| {
+                            matches!(item.as_str(), Some("online_state_timeout") | Some("all"))
+                        }),
+                        _ => false,
+                    };
+                    if fires
+                        && !harness.write_mode
+                        && (harness.online_state == OnlineState::Unknown
+                            || harness.offline_timeout_armed)
+                    {
+                        harness.go_offline(&mut emitted);
+                    }
+                }
                 "watchEntity" if harness.unlistened => {
                     // Updates addressed to an inactive target are
                     // ignored by the client.
@@ -1686,6 +1857,27 @@ fn run_case(case: &Json) -> Outcome {
                             // inherently preserved; verify the
                             // re-add request would send the token.
                             return Outcome::Failed(at(message));
+                        } else if !harness.write_mode && !harness.unlistened {
+                            // Online-state tracking: from Unknown
+                            // a single failure is enough; from
+                            // Online the first failure arms the
+                            // online-state timeout and a second
+                            // consecutive failure (or the timeout
+                            // firing) goes Offline.
+                            match harness.online_state {
+                                OnlineState::Unknown => {
+                                    harness.go_offline(&mut emitted);
+                                }
+                                OnlineState::Online => {
+                                    harness.stream_failures += 1;
+                                    if harness.stream_failures >= 2 {
+                                        harness.go_offline(&mut emitted);
+                                    } else {
+                                        harness.offline_timeout_armed = true;
+                                    }
+                                }
+                                OnlineState::Offline => {}
+                            }
                         }
                     }
                 }
@@ -1739,6 +1931,17 @@ fn run_case(case: &Json) -> Outcome {
             ));
         }
 
+        if !harness.write_mode
+            && emitted.iter().any(|event| {
+                matches!(
+                    event,
+                    Emitted::Snapshot(_) | Emitted::Pseudo(_) | Emitted::Offline(_)
+                )
+            })
+        {
+            harness.listen_delivered = true;
+        }
+
         // Compare this step's expected snapshot events, if any.
         if let Some(expected_events) = step.get("expectedSnapshotEvents") {
             let expected_events = expected_events.as_array().cloned().unwrap_or_default();
@@ -1779,8 +1982,10 @@ fn run_case(case: &Json) -> Outcome {
                 let expects_none = active.as_object().map(|o| o.is_empty()).unwrap_or(false);
                 // While offline, the client's targets are all
                 // inactive in the spec model.
-                let harness_active =
-                    harness.state.is_some() && !harness.unlistened && harness.online;
+                let harness_active = harness.state.is_some()
+                    && !harness.unlistened
+                    && harness.online
+                    && harness.online_state != OnlineState::Offline;
                 if expects_none && harness_active {
                     return Outcome::Failed(at(
                         "expected no active targets, harness still listens".to_string(),
@@ -1895,14 +2100,19 @@ fn compare_events(
                 Emitted::Error(code) => {
                     return Err(format!("expected error {error_code}, got error {code}"));
                 }
-                Emitted::Snapshot(_) | Emitted::Pseudo(_) | Emitted::Composed { .. } => {
+                Emitted::Snapshot(_)
+                | Emitted::Pseudo(_)
+                | Emitted::Offline(_)
+                | Emitted::Composed { .. } => {
                     return Err(format!("expected error {error_code}, got a snapshot"));
                 }
             }
         }
         let mut actual_metadata: Vec<String> = Vec::new();
         let snapshot = match actual {
-            Emitted::Snapshot(snapshot) | Emitted::Pseudo(snapshot) => snapshot,
+            Emitted::Snapshot(snapshot)
+            | Emitted::Pseudo(snapshot)
+            | Emitted::Offline(snapshot) => snapshot,
             Emitted::Composed {
                 snapshot,
                 from_cache,
@@ -2263,6 +2473,11 @@ fn existence_filter_spec_suite() {
 #[test]
 fn resume_token_spec_suite() {
     assert_suite("resume_token_spec_test.json", "resume token");
+}
+
+#[test]
+fn offline_spec_suite() {
+    assert_suite("offline_spec_test.json", "offline");
 }
 
 /// Vendoring integrity: every suite file parses and the case
