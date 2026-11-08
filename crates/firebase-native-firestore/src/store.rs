@@ -283,7 +283,6 @@ impl LocalStore {
     // --- target state ----------------------------------------------
 
     /// Stores a target's resume token and snapshot version.
-    #[allow(dead_code)]
     pub(crate) fn put_target_state(&self, target_id: i64, state: &TargetState) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
@@ -305,7 +304,6 @@ impl LocalStore {
     }
 
     /// Reads a target's stored state, if any.
-    #[allow(dead_code)]
     pub(crate) fn target_state(&self, target_id: i64) -> Result<Option<TargetState>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let row = conn
