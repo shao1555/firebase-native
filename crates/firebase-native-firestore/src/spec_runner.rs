@@ -34,7 +34,9 @@ use crate::google::firestore::v1::{
     DocumentChange as ProtoDocumentChange, DocumentDelete, ExistenceFilter, ListenResponse, Target,
     TargetChange,
 };
-use crate::listen::{DocumentChange, DocumentChangeKind, Snapshot, WatchEvent, WatchState};
+use crate::listen::{
+    DocumentChange, DocumentChangeKind, Snapshot, SnapshotMetadata, WatchEvent, WatchState,
+};
 use crate::mutation::Mutation;
 use crate::query::{FieldOp, Filter, Order, Query, UnaryOp};
 use crate::store::LocalStore;
@@ -837,6 +839,7 @@ impl Harness {
             documents,
             changes,
             read_time: None,
+            metadata: SnapshotMetadata::default(),
         }));
         self.listen_delivered = true;
     }
@@ -1917,6 +1920,10 @@ impl Harness {
                 documents: composed.into_values().collect(),
                 changes,
                 read_time: None,
+                metadata: SnapshotMetadata {
+                    is_from_cache: meta.0,
+                    has_pending_writes: meta.1,
+                },
             },
             from_cache: meta.0,
             has_pending: meta.1,
@@ -2437,6 +2444,7 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                             documents,
                             changes: Vec::new(),
                             read_time: None,
+                            metadata: SnapshotMetadata::default(),
                         }));
                     }
                     harness.online = online;
@@ -2579,6 +2587,7 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                                 documents: seed,
                                 changes,
                                 read_time: None,
+                                metadata: SnapshotMetadata::default(),
                             }));
                         }
                     }
@@ -2614,6 +2623,7 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                             documents,
                             changes,
                             read_time: None,
+                            metadata: SnapshotMetadata::default(),
                         }));
                     }
                     harness.had_listen = true;
@@ -2790,6 +2800,10 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                                     documents,
                                     changes: Vec::new(),
                                     read_time: None,
+                                    metadata: SnapshotMetadata {
+                                        is_from_cache: true,
+                                        has_pending_writes: has_pending,
+                                    },
                                 },
                                 from_cache: true,
                                 has_pending,
@@ -3387,6 +3401,7 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                                 documents: seed,
                                 changes: Vec::new(),
                                 read_time: None,
+                                metadata: SnapshotMetadata::default(),
                             }));
                         }
                     } else if target_ids.is_empty() {
@@ -3466,6 +3481,7 @@ fn run_case_named(name: &str, case: &Json) -> Outcome {
                                     documents: harness.view.values().cloned().collect(),
                                     changes: Vec::new(),
                                     read_time: None,
+                                    metadata: SnapshotMetadata::default(),
                                 }));
                             }
                             harness.limbo_dirty = false;
