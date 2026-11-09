@@ -84,6 +84,27 @@ pub struct Snapshot {
     pub changes: Vec<DocumentChange>,
     /// The server time this snapshot is consistent at, when reported.
     pub read_time: Option<Timestamp>,
+    /// Where this snapshot came from and whether unacknowledged
+    /// local writes affect it.
+    pub metadata: SnapshotMetadata,
+}
+
+/// Provenance of a [`Snapshot`], mirroring the native SDKs'
+/// `SnapshotMetadata`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    /// This snapshot reflects the local store's composed view —
+    /// the initial cache snapshot and latency-compensated local
+    /// updates — rather than a server round-trip. Only a watch
+    /// backed by a local store produces these; the first
+    /// snapshot with this `false` marks the watch's initial
+    /// sync (one full server round-trip for the target).
+    pub is_from_cache: bool,
+    /// The local store holds mutations affecting this watch
+    /// that the server has not acknowledged yet: a mutation on
+    /// a document in the snapshot, on the watched document, or
+    /// on any member of the watched collection.
+    pub has_pending_writes: bool,
 }
 
 /// A live watch on a query or document. Snapshots arrive through
@@ -281,9 +302,6 @@ impl WatchState {
 
     /// Whether the target has been marked CURRENT since its
     /// (re)add.
-    // Exercised by the spec-test harness (and staged for
-    // store-backed watches in the driver).
-    #[allow(dead_code)]
     pub(crate) fn is_current(&self) -> bool {
         self.current_received
     }
@@ -684,6 +702,13 @@ impl WatchState {
             documents: ordered,
             changes,
             read_time,
+            // Until the target is CURRENT the initial result
+            // set is incomplete: partial deliveries are cache
+            // state, not the initial-sync signal.
+            metadata: SnapshotMetadata {
+                is_from_cache: !self.current_received,
+                has_pending_writes: false,
+            },
         }))
     }
 
@@ -921,6 +946,37 @@ impl StoreWatch {
         documents
     }
 
+    /// Whether unacknowledged mutations affect this watch:
+    /// a mutation on a document of `view`, on the watched
+    /// document, or — for a query — on any member of the
+    /// watched collection (which covers pending creates and
+    /// deletes whose document is not in the current view).
+    fn has_pending_writes(&self, view: &[Document]) -> bool {
+        match &self.source {
+            // Independent of the view: a pending delete removes
+            // the document from the composed view entirely, so
+            // view membership can never observe it.
+            WatchSource::Document { relative_path } => {
+                self.engine.has_pending(relative_path).unwrap_or(false)
+            }
+            WatchSource::Query {
+                parent_relative,
+                query,
+            } => {
+                let in_view = view.iter().any(|document| {
+                    self.engine
+                        .relative_path_of(&document.name)
+                        .is_some_and(|relative| self.engine.has_pending(relative).unwrap_or(false))
+                });
+                in_view
+                    || self
+                        .engine
+                        .has_pending_in_collection(parent_relative, query.collection_id())
+                        .unwrap_or(false)
+            }
+        }
+    }
+
     /// Persists the target's resume token and snapshot version
     /// at a consistent point. Best effort: a store failure must
     /// not kill a healthy watch — the token is an optimization,
@@ -943,6 +999,13 @@ struct StoreDelivery {
     delivered_once: bool,
     last_read_time: Option<Timestamp>,
     seen_generation: u64,
+    /// Metadata of the last delivered snapshot. A snapshot is
+    /// delivered when its documents change *or* its metadata
+    /// does — the cache-to-server flip (initial sync) and the
+    /// pending-writes flag clearing on acknowledgement are
+    /// observable events even when the view itself is unchanged,
+    /// matching the native SDKs.
+    last_metadata: Option<SnapshotMetadata>,
 }
 
 impl StoreDelivery {
@@ -952,6 +1015,7 @@ impl StoreDelivery {
             delivered_once: false,
             last_read_time: None,
             seen_generation: 0,
+            last_metadata: None,
         }
     }
 
@@ -959,10 +1023,14 @@ impl StoreDelivery {
     /// what was delivered (the first call always emits: the
     /// cache snapshot). Returns false when the listener is gone
     /// or the store failed (the error is delivered first).
+    /// `from_cache` records the event's origin: `true` for the
+    /// initial cache snapshot and local (latency-compensated)
+    /// updates, `false` when a server snapshot was just applied.
     async fn emit(
         &mut self,
         watch: &StoreWatch,
         sender: &tokio::sync::mpsc::Sender<Result<Snapshot>>,
+        from_cache: bool,
     ) -> bool {
         let view = match watch.composed() {
             Ok(view) => view,
@@ -973,16 +1041,22 @@ impl StoreDelivery {
         };
         self.seen_generation = watch.engine.generation();
         let changes = diff_snapshots(&self.delivered, &view);
-        if changes.is_empty() && self.delivered_once {
+        let metadata = SnapshotMetadata {
+            is_from_cache: from_cache,
+            has_pending_writes: watch.has_pending_writes(&view),
+        };
+        if changes.is_empty() && self.delivered_once && self.last_metadata == Some(metadata) {
             return true;
         }
         self.delivered_once = true;
         self.delivered = view.clone();
+        self.last_metadata = Some(metadata);
         sender
             .send(Ok(Snapshot {
                 documents: view,
                 changes,
                 read_time: self.last_read_time,
+                metadata,
             }))
             .await
             .is_ok()
@@ -1131,7 +1205,7 @@ async fn sleep_with_delivery(
     let deadline = tokio::time::Instant::now() + delay;
     loop {
         if watch.engine.generation() != delivery.seen_generation {
-            if !delivery.emit(watch, sender).await {
+            if !delivery.emit(watch, sender, true).await {
                 return false;
             }
             continue;
@@ -1146,7 +1220,7 @@ async fn sleep_with_delivery(
         tokio::select! {
             _ = tokio::time::sleep(remaining) => return true,
             _ = notified => {
-                if !delivery.emit(watch, sender).await {
+                if !delivery.emit(watch, sender, true).await {
                     return false;
                 }
             }
@@ -1283,7 +1357,7 @@ async fn run_watch(
     let mut last_state_docs: Vec<Document> = Vec::new();
     if let Some(watch) = &store_watch {
         last_state_docs = watch.seed(&mut state);
-        if !delivery.emit(watch, &sender).await {
+        if !delivery.emit(watch, &sender, true).await {
             return;
         }
     }
@@ -1388,7 +1462,7 @@ async fn run_watch(
             };
             if let Some(watch) = &store_watch {
                 if watch.engine.generation() != delivery.seen_generation {
-                    if !delivery.emit(watch, &sender).await {
+                    if !delivery.emit(watch, &sender, true).await {
                         return;
                     }
                     continue 'stream;
@@ -1401,7 +1475,7 @@ async fn run_watch(
                     // acknowledgement fold, a cached fetch):
                     // recompose and deliver if the view moved.
                     if let Some(watch) = &store_watch {
-                        if !delivery.emit(watch, &sender).await {
+                        if !delivery.emit(watch, &sender, true).await {
                             return;
                         }
                     }
@@ -1518,7 +1592,7 @@ async fn run_watch(
                                     watch.persist_target(&state, snapshot.read_time);
                                     last_state_docs = snapshot.documents.clone();
                                     delivery.last_read_time = snapshot.read_time;
-                                    if !delivery.emit(watch, &sender).await {
+                                    if !delivery.emit(watch, &sender, !state.is_current()).await {
                                         return;
                                     }
                                 } else if sender.send(Ok(snapshot)).await.is_err() {
@@ -1561,7 +1635,7 @@ async fn run_watch(
                                     } else {
                                         last_state_docs.clear();
                                     }
-                                    if !delivery.emit(watch, &sender).await {
+                                    if !delivery.emit(watch, &sender, !state.is_current()).await {
                                         return;
                                     }
                                 } else if let Some(snapshot) = snapshot {
@@ -2080,6 +2154,29 @@ mod tests {
         let event = state.on_response(target_change(Type::Current, Some((3, 0)), b"t1"));
         assert!(matches!(event, Some(WatchEvent::Snapshot(_))));
         assert_eq!(state.resume_token(), Some(b"t1".as_slice()));
+    }
+
+    #[test]
+    fn pre_current_snapshots_stay_from_cache_until_current() {
+        let mut state = watch();
+        state.on_response(change("notes/a", &[("n", Value::Integer(1))]));
+        // A stream-wide NO_CHANGE delivers the partial initial
+        // set before CURRENT: not the initial sync yet.
+        let event = state.on_response(no_change_at(2));
+        let Some(WatchEvent::Snapshot(snapshot)) = event else {
+            panic!("expected a pre-CURRENT snapshot, got {event:?}");
+        };
+        assert_eq!(snapshot.documents.len(), 1);
+        assert!(snapshot.metadata.is_from_cache);
+        // The rest of the initial set, then CURRENT: this
+        // snapshot completes the initial sync.
+        state.on_response(change("notes/b", &[("n", Value::Integer(1))]));
+        let event = state.on_response(target_change(Type::Current, Some((3, 0)), b"t1"));
+        let Some(WatchEvent::Snapshot(snapshot)) = event else {
+            panic!("expected a CURRENT snapshot, got {event:?}");
+        };
+        assert_eq!(snapshot.documents.len(), 2);
+        assert!(!snapshot.metadata.is_from_cache);
     }
 
     fn seed_doc(name: &str) -> crate::value::Document {
@@ -3029,14 +3126,17 @@ mod tests {
         let mut delivery = StoreDelivery::new();
 
         // The first emit is the cache snapshot.
-        assert!(delivery.emit(&store_watch, &sender).await);
+        assert!(delivery.emit(&store_watch, &sender, true).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert_eq!(snapshot.documents.len(), 1);
         assert_eq!(snapshot.changes.len(), 1);
         assert_eq!(snapshot.changes[0].kind, DocumentChangeKind::Added);
+        // The cache snapshot: from cache, nothing pending.
+        assert!(snapshot.metadata.is_from_cache);
+        assert!(!snapshot.metadata.has_pending_writes);
 
         // Nothing changed: no further snapshot.
-        assert!(delivery.emit(&store_watch, &sender).await);
+        assert!(delivery.emit(&store_watch, &sender, true).await);
         assert!(receiver.try_recv().is_err());
 
         // A queued local write appears in the composed view as
@@ -3056,7 +3156,7 @@ mod tests {
                 transforms: Vec::new(),
             }])
             .unwrap();
-        assert!(delivery.emit(&store_watch, &sender).await);
+        assert!(delivery.emit(&store_watch, &sender, true).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert_eq!(snapshot.documents.len(), 2);
         assert_eq!(snapshot.changes.len(), 1);
@@ -3065,6 +3165,78 @@ mod tests {
             snapshot.changes[0].document.name,
             format!("{PREFIX}/notes/b")
         );
+        // The latency-compensated snapshot is cache state and
+        // reports the queued write as pending.
+        assert!(snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+    }
+
+    #[tokio::test]
+    async fn store_delivery_classifies_server_snapshots_and_pending_deletes() {
+        let (engine, store_watch) = test_store_watch();
+        engine
+            .store_remote_document(&stored_doc("notes/a", 1))
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let mut delivery = StoreDelivery::new();
+
+        // A pending delete of a collection member that is not
+        // in the composed view still counts as pending writes
+        // for the watch.
+        engine
+            .store()
+            .enqueue_batch(&[crate::mutation::Mutation::Delete {
+                path: "notes/ghost".to_string(),
+            }])
+            .unwrap();
+        // The cache snapshot reports the pending delete too.
+        assert!(delivery.emit(&store_watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert!(snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+
+        // A server snapshot over the unchanged view is still
+        // delivered: the metadata flip is itself the event
+        // (it marks the initial sync).
+        assert!(delivery.emit(&store_watch, &sender, false).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(snapshot.documents.len(), 1);
+        assert!(!snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+
+        // Nothing changed since: no further snapshot.
+        assert!(delivery.emit(&store_watch, &sender, false).await);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn store_delivery_reports_a_pending_delete_on_a_document_watch() {
+        let (engine, _) = test_store_watch();
+        let watch = StoreWatch::new(
+            engine.clone(),
+            WatchSource::Document {
+                relative_path: "notes/a".to_string(),
+            },
+            43,
+        );
+        engine
+            .store_remote_document(&stored_doc("notes/a", 1))
+            .unwrap();
+        engine
+            .store()
+            .enqueue_batch(&[crate::mutation::Mutation::Delete {
+                path: "notes/a".to_string(),
+            }])
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let mut delivery = StoreDelivery::new();
+        assert!(delivery.emit(&watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        // The composed view is empty (the delete is already
+        // applied locally), but the watch still reports the
+        // unacknowledged write.
+        assert!(snapshot.documents.is_empty());
+        assert!(snapshot.metadata.has_pending_writes);
     }
 
     struct OfflineTokens;

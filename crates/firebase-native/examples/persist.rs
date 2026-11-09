@@ -234,6 +234,13 @@ async fn main() -> ExitCode {
             .ok_or("watch ended before the cache snapshot")?
             .map_err(|err| format!("cache snapshot failed: {err}"))?;
         println!("cache snapshot: {} document(s)", first.documents.len());
+        if !first.metadata.is_from_cache {
+            return Err("cache snapshot is not marked from-cache".to_string());
+        }
+        if first.metadata.has_pending_writes {
+            return Err("cache snapshot unexpectedly reports pending writes".to_string());
+        }
+        println!("cache snapshot metadata: from-cache, no pending writes");
         if first.documents.len() != 1 {
             return Err("cache snapshot does not hold the watched document".to_string());
         }
@@ -249,9 +256,14 @@ async fn main() -> ExitCode {
             .map_err(|err| format!("watched set failed: {err}"))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut saw_update = false;
+        let mut saw_server = false;
         while std::time::Instant::now() < deadline && !saw_update {
             match tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await {
                 Ok(Some(Ok(snapshot))) => {
+                    if !snapshot.metadata.is_from_cache && !saw_server {
+                        saw_server = true;
+                        println!("server snapshot received (initial sync complete)");
+                    }
                     saw_update = snapshot.documents.iter().any(|document| {
                         document.fields.get("content")
                             == Some(&Value::String("updated while watched".to_string()))
@@ -266,6 +278,27 @@ async fn main() -> ExitCode {
             return Err("no snapshot showed the local update".to_string());
         }
         println!("watch snapshot with the local update: received");
+        // The initial server snapshot (and the write
+        // acknowledgement, which clears the pending flag) are
+        // metadata flips: they are delivered even when the view
+        // itself does not move. Drain until one is observed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !saw_server && std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), listener.next()).await {
+                Ok(Some(Ok(snapshot))) => {
+                    if !snapshot.metadata.is_from_cache {
+                        saw_server = true;
+                    }
+                }
+                Ok(Some(Err(err))) => return Err(format!("watch snapshot failed: {err}")),
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        if !saw_server {
+            return Err("no server snapshot arrived during the watch phase".to_string());
+        }
+        println!("server snapshot received (initial sync complete)");
         drop(listener);
         persistent
             .delete_document(&path)

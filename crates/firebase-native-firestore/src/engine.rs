@@ -406,6 +406,24 @@ impl PersistenceEngine {
         self.store.has_pending_mutation_for(relative_path)
     }
 
+    /// Whether any queued mutation touches a direct child of
+    /// the collection `collection_id` under `parent_relative`
+    /// (the members a query over that collection sees).
+    pub(crate) fn has_pending_in_collection(
+        &self,
+        parent_relative: &str,
+        collection_id: &str,
+    ) -> Result<bool> {
+        let prefix = Self::collection_prefix(parent_relative, collection_id);
+        for batch in self.store.peek_batches(usize::MAX)? {
+            let paths = batch.mutations.iter().map(|mutation| mutation.path());
+            if !Self::collection_members(&prefix, paths).is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The collection prefix (relative, trailing slash) a query
     /// under `parent_relative` scans: `notes/` at the root,
     /// `spaces/personal/notes/` below a document.
