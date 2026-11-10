@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Cloud Storage for Firebase for `firebase-native`.
 //!
 //! A client for the Storage JSON API at

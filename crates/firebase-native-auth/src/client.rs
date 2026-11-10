@@ -33,6 +33,17 @@ struct AuthState {
     generation: u64,
 }
 
+/// The Firebase Authentication client.
+///
+/// Construct with [`Auth::new`] (no session persistence) or
+/// [`Auth::with_store`] (sessions persisted through the
+/// shell's [`firebase_native_core::CredentialStore`]). All
+/// sign-in methods return a [`SignedIn`] carrying the user
+/// and, when a store is attached, the offline token for
+/// later activation via [`Auth::restore_session`]. The
+/// client implements
+/// [`firebase_native_core::TokenProvider`], so it can be
+/// shared with the service clients as their token source.
 pub struct Auth {
     options: FirebaseOptions,
     http: reqwest::Client,

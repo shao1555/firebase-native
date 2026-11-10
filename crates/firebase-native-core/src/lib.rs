@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Core types shared by every `firebase-native` service crate.
 //!
 //! This crate owns no network code. It defines:

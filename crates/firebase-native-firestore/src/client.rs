@@ -131,9 +131,6 @@ impl Firestore {
         Ok(self)
     }
 
-    /// Waits until every queued local write has been committed (or
-    /// fails with the error of a batch the server permanently
-    /// rejected). A no-op for clients without local persistence.
     /// Enqueues one mutation in persistent mode and returns the
     /// resulting local view of the document.
     fn enqueue_and_view(
@@ -148,6 +145,19 @@ impl Firestore {
             .ok_or_else(|| Error::Other("local view lost the document after enqueue".to_string()))
     }
 
+    /// Waits until the mutation queue is empty.
+    ///
+    /// This is a queue-empty wait, not a snapshot of the
+    /// writes queued at call time: batches enqueued by other
+    /// tasks while this future is pending are waited for too.
+    /// When the queue drains the call returns `Ok(())` -
+    /// unless a queued write was permanently rejected by the
+    /// server along the way, in which case the rejection is
+    /// remembered and the first waiter to observe the empty
+    /// queue returns it as an `Err` (the rejected batch
+    /// itself was dropped from the queue). With no local
+    /// store enabled nothing is ever queued, so it returns
+    /// `Ok(())` immediately.
     pub async fn wait_for_pending_writes(&self) -> Result<()> {
         match &self.engine {
             Some(engine) => engine.wait_for_pending_writes().await,
@@ -203,7 +213,7 @@ impl Firestore {
     // -- Listen (P1) ------------------------------------------------------
 
     /// Watches a collection query: opens a Listen stream and returns
-    /// a [`Listener`] yielding a snapshot at `CURRENT` and at every
+    /// a [`crate::Listener`] yielding a snapshot at `CURRENT` and at every
     /// later consistent point where the view changed. `parent_path`
     /// follows the same convention as [`Firestore::run_query`].
     ///
