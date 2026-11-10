@@ -25,6 +25,14 @@ for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 > caller-held offline tokens, with hash-addressed sign-out and
 > an unauthenticated wipe (P5).
 
+## Documentation
+
+Guides live in [`docs/`](docs/README.md): getting started,
+auth and the session model, Firestore, Storage, and the
+design invariants. The full API reference is the rustdoc
+(`cargo doc --workspace --open`); every public item is
+documented.
+
 ## Crates
 
 | Crate | Contents |

@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Firebase Authentication for `firebase-native`, implemented directly
 //! over the Identity Toolkit REST API
 //! (`identitytoolkit.googleapis.com/v1/accounts:*`) and the Secure Token

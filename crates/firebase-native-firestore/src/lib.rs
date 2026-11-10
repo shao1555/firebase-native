@@ -1,23 +1,53 @@
+#![warn(missing_docs)]
 //! Cloud Firestore for `firebase-native`, over gRPC (`tonic`).
 //!
-//! The public API is a hand-written model — [`Value`], [`Document`],
-//! [`Query`] — and never exposes the generated `prost` types; a
-//! conversion layer in [`value`](crate::value) translates between the
-//! two. Tokens are obtained per call through
+//! The public API is a hand-written model - [`Value`], [`Document`],
+//! [`Query`] - and never exposes the generated `prost` types; an
+//! internal conversion layer translates between the two. Tokens are
+//! obtained per call through
 //! [`firebase_native_core::TokenProvider`]; on an `UNAUTHENTICATED`
 //! status the client forces one token refresh and retries the call
 //! exactly once.
 //!
-//! P0 scope was online-only unary operations: get / create / set /
-//! update / delete / list and a basic structured `run_query`. P1 adds
-//! the Listen stream ([`Firestore::watch_query`] /
-//! [`Firestore::watch_document`]). P2 (part 1) adds offline
-//! persistence: with [`Firestore::enable_local_store`] writes are
-//! queued in a local SQLite store, reflected in reads immediately,
-//! and committed in the background over the Write stream, surviving
-//! restarts. Listen results do not flow through the store yet, and
-//! queries still run online in persistent mode; the Write/Listen
-//! spec-test suites land in P2 (part 2).
+//! # What the client covers
+//!
+//! - Unary document operations ([`Firestore::get_document`],
+//!   [`Firestore::create_document`], [`Firestore::set_document`],
+//!   [`Firestore::update_document`], [`Firestore::delete_document`],
+//!   [`Firestore::list_documents`]) and structured queries
+//!   ([`Firestore::run_query`]).
+//! - Server-computed field values through the [`FieldValue`]
+//!   sentinel API ([`Firestore::set_document_with`] /
+//!   [`Firestore::update_document_with`]).
+//! - Realtime watches ([`Firestore::watch_query`] /
+//!   [`Firestore::watch_document`]) over the Listen stream, with
+//!   resume tokens, production limbo resolution, and
+//!   [`SnapshotMetadata`] (`is_from_cache` / `has_pending_writes`)
+//!   on every [`Snapshot`].
+//! - Offline persistence via [`Firestore::enable_local_store`]:
+//!   writes queue in a local SQLite store, reads and watches are
+//!   served from the composed local view with latency
+//!   compensation, and the queue drains over the Write stream in
+//!   the background, surviving restarts. Query evaluation is
+//!   local-first against that view.
+//! - Per-user store conventions ([`user_store_path`],
+//!   [`wipe_user_store`], [`wipe_all_user_stores`]) so several
+//!   users of one device keep separate caches.
+//!
+//! # Example
+//!
+//! ```text
+//! use firebase_native_firestore::{Filter, Order, Query, Value};
+//!
+//! let query = Query::new("cities")
+//!     .filter(Filter::eq("capital", Value::Bool(true)))
+//!     .order_by(Order::asc("name"))
+//!     .limit(10);
+//! ```
+//!
+//! Network use starts from [`Firestore::new`] with an `App` and a
+//! token provider; see the guides under `docs/` in the
+//! repository for end-to-end examples.
 
 // Generated protobuf modules. Placed at the crate root under `google`
 // because the generated code resolves cross-package references by
@@ -114,9 +144,14 @@ fn uid_dir_name(uid: &str) -> String {
 /// directory created via [`user_store_path`]). This is the
 /// store side of sign-out: pair it with
 /// `firebase_native_auth::Auth::sign_out` /
-/// `sign_out_session`. The caller must have dropped the
-/// `Firestore` instance using the store first — deletion
-/// while an engine is running is not interlocked. A missing
+/// `sign_out_session`. The store must not be open in any
+/// process: a persistence engine, once started, runs for
+/// the rest of its process's lifetime - there is no
+/// shutdown API yet, and dropping the client does not stop
+/// it - and this wipe has no cross-process coordination,
+/// so in practice call this before the owning application
+/// opens the store, or after it has exited. Deletion while
+/// an engine is running is not interlocked. A missing
 /// store is not an error.
 pub fn wipe_user_store(root: &std::path::Path, uid: &str) -> firebase_native_core::Result<()> {
     remove_dir_if_present(&root.join(uid_dir_name(uid)))
@@ -126,8 +161,9 @@ pub fn wipe_user_store(root: &std::path::Path, uid: &str) -> firebase_native_cor
 /// root directory): the store side of the kill switch, paired
 /// with `firebase_native_auth::Auth::wipe_all_sessions`. The
 /// root is expected to be dedicated to these stores. The
-/// caller must have dropped all `Firestore` instances using
-/// them first. A missing root is not an error.
+/// same not-open-in-any-process requirement as
+/// [`wipe_user_store`] applies to every store under the
+/// root. A missing root is not an error.
 pub fn wipe_all_user_stores(root: &std::path::Path) -> firebase_native_core::Result<()> {
     remove_dir_if_present(root)
 }

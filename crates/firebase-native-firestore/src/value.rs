@@ -135,6 +135,8 @@ pub(crate) mod lossless_f64 {
     }
 }
 
+/// A geographic point, the public form of Firestore's
+/// `LatLng` value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GeoPoint {
     /// Latitude in degrees.
