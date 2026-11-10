@@ -38,14 +38,14 @@ async fn main() -> ExitCode {
         let path = required("FIREBASE_WATCH_PATH")?;
         let app = App::new(options);
         let auth = Arc::new(Auth::new(&app));
-        let user = auth
+        let signed_in = auth
             .sign_in_with_custom_token(&required("FIREBASE_CUSTOM_TOKEN")?)
             .await
             .map_err(|e| e.to_string())?;
         println!(
             "signed in: uid={} email={}",
-            user.uid,
-            user.email.as_deref().unwrap_or("-")
+            signed_in.user.uid,
+            signed_in.user.email.as_deref().unwrap_or("-")
         );
 
         let firestore = Firestore::new(&app, auth);

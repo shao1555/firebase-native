@@ -51,14 +51,14 @@ async fn main() -> ExitCode {
 
         let auth = Arc::new(Auth::new(&app));
         let custom_token = required("FIREBASE_CUSTOM_TOKEN")?;
-        let user = auth
+        let signed_in = auth
             .sign_in_with_custom_token(&custom_token)
             .await
             .map_err(|err| format!("sign-in failed: {err}"))?;
         println!(
             "signed in: uid={} email={}",
-            user.uid,
-            user.email.as_deref().unwrap_or("-")
+            signed_in.user.uid,
+            signed_in.user.email.as_deref().unwrap_or("-")
         );
 
         let store_path = required("FIREBASE_STORE_PATH")?;

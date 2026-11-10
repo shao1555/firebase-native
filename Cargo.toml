@@ -24,6 +24,7 @@ firebase-native-firestore = { path = "crates/firebase-native-firestore", version
 firebase-native-storage = { path = "crates/firebase-native-storage", version = "0.1.0" }
 
 async-trait = "0.1"
+aws-lc-rs = "1"
 bytes = "1"
 prost = "0.13"
 prost-types = "0.13"

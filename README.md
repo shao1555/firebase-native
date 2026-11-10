@@ -9,7 +9,7 @@ wrapping the official Firebase C++ SDK. Pure Rust means it builds
 natively for every target Rust supports, including Windows on ARM64,
 for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 
-> Status: **P3 complete** — Auth sign-in/refresh, Firestore unary
+> Status: **P5 complete** — Auth sign-in/refresh, Firestore unary
 > CRUD, the Listen stream (reconnect/resume, production limbo
 > resolution), the local store with offline persistence and
 > latency compensation, the Write stream, local query evaluation
@@ -20,6 +20,10 @@ for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 > `crates/firebase-native-firestore/tests/spec_tests/`). Storage
 > (simple and resumable uploads, download, metadata, list,
 > delete) is implemented over the JSON API and live-verified.
+> Auth sessions persist as a multi-user collection with an
+> ID-token cache: sessions activate offline from the cache via
+> caller-held offline tokens, with hash-addressed sign-out and
+> an unauthenticated wipe (P5).
 
 ## Crates
 
@@ -27,7 +31,7 @@ for which the C++ SDK ships no prebuilt libraries (x86/x64 only).
 |---|---|
 | `firebase-native` | Umbrella crate re-exporting the crates below. |
 | `firebase-native-core` | `App`, `FirebaseOptions`, the shared `Error` type, the `TokenProvider` trait, and the `CredentialStore` trait. |
-| `firebase-native-auth` | Identity Toolkit REST client: custom token, email/password, anonymous and IdP sign-in; automatic token refresh; session restore via `CredentialStore`. |
+| `firebase-native-auth` | Identity Toolkit REST client: custom token, email/password, anonymous and IdP sign-in; automatic token refresh; multi-user session persistence via `CredentialStore` with offline (ID-cache) activation by offline token, session facts, targeted sign-out and a wipe-all kill switch. |
 | `firebase-native-firestore` | Firestore gRPC client with a hand-written public `Value` model (generated protobuf types are never exposed). |
 | `firebase-native-storage` | Cloud Storage for Firebase over the JSON API: simple (media/multipart) and resumable uploads, download, metadata, listing and delete. |
 
@@ -102,7 +106,11 @@ the vendored googleapis protos (pinned at commit
   suites; listen-through-store, local query evaluation, the public
   FieldValue sentinel API, and production limbo resolution. ✅
 - **P3** — Storage implementation. ✅
-- **P4** — Integration into a production native client app.
+- **P4** — Integration into a production native client app. ✅
+- **P5** — Offline session restore and multi-user session
+  management: ID-cache persistence, offline activation via
+  offline tokens, per-uid local stores, hash-addressed
+  sign-out, and the unauthenticated kill switch. ✅
 
 ## License
 

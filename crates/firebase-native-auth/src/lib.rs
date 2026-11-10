@@ -19,4 +19,4 @@ mod session;
 mod wire;
 
 pub use client::Auth;
-pub use session::User;
+pub use session::{SessionFacts, SessionKey, SignedIn, User};
