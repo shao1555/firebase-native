@@ -11,6 +11,7 @@ description = "Firebase Authentication client for firebase-native, over the Iden
 
 [dependencies]
 firebase-native-core.workspace = true
+aws-lc-rs.workspace = true
 base64 = "0.22"
 async-trait.workspace = true
 reqwest.workspace = true
