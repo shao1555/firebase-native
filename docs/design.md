@@ -52,6 +52,20 @@ stores are explicit file paths. If persistence fails, the
 operation fails — there is no silent fallback to weaker
 storage.
 
+Cache *size management* is the deliberate exception to
+delegation, for the same reason sessions are shaped the
+way they are: the mechanism lives where the facts are.
+Eviction decisions need per-document access order, target
+membership and pending-mutation state — all store-internal,
+all racy to reconstruct from outside. So the library owns
+the LRU mechanism (inside the store schema, in the same
+transaction boundary as the writes it describes) and the
+caller owns exactly one policy value: the size threshold,
+or an unlimited opt-out. Lost GC bookkeeping degrades to
+"untracked documents are the oldest", never to a purge —
+the store co-locates the reconstructible cache with the
+irreplaceable mutation queue.
+
 ## The local view is the composed truth
 
 In persistent mode, reads, query evaluation and watches all
