@@ -164,6 +164,63 @@ store and switches the client to persistent mode:
 Without `enable_local_store` the client is online-only and
 stateless.
 
+### Cache size management
+
+The cache is garbage-collected against a size threshold.
+The default is **100 MiB** of live payload (cached document
+bytes plus queued mutation bytes), matching the native
+SDKs' default; configure it — or opt out — through
+`enable_local_store_with_options`:
+
+```rust
+use firebase_native_firestore::{LocalStoreOptions, DEFAULT_CACHE_SIZE_LIMIT_BYTES};
+
+let firestore = firestore
+    .enable_local_store_with_options(path, LocalStoreOptions {
+        cache_size_limit: Some(50 * 1024 * 1024), // or None for unlimited
+    })?;
+```
+
+When the store exceeds the threshold, the write pump's
+idle moments evict least-recently-accessed documents in
+batches until the payload fits again. Two classes of
+document are **never** evicted:
+
+- documents in the current view of an open watch (target
+  membership is tracked in the store while the watch is
+  open), and
+- documents touched by a queued, unacknowledged mutation.
+
+Eviction never touches the mutation queue. Two
+consistency side effects are deliberate: a collection an
+eviction cut into is marked *incomplete*, so local-first
+`run_query` refills it from the server instead of trusting
+a partial view (only a sync covering the *entire*
+collection — an unfiltered, unbounded watch sync or
+online refill — clears the mark; a filtered watch
+legitimately never sees the rest); and a closed watch
+whose cached baseline lost a document has its
+resume-token state deleted — a resumed
+Listen delivers only deltas, so the token must never be
+offered against a partial baseline, and the watch's next
+open re-adds the target in full. Selection, protection
+revalidation and deletion happen in a single store
+transaction, so a write enqueued or a watch opened
+concurrently cannot slip past the checks. Unary-read cache
+fills (`get_document` / `run_query`) also schedule
+collection, not just writes and watches. Documents whose
+access bookkeeping is missing — written by older versions,
+or after any internal inconsistency — count as the oldest
+and are evicted first; the collector never escalates to a
+purge.
+
+The threshold is a cleanup trigger, not a hard bound:
+protected documents can keep the store above it. For
+display or logging, `local_store_size_bytes()` reports
+the store file's current on-disk size (page-count based);
+it can stay above the threshold while freed pages await
+reuse or vacuuming even after the live payload fits.
+
 ## Per-user stores
 
 On a device shared by several users, give each user their

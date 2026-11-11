@@ -77,6 +77,45 @@ pub struct ListDocumentsResult {
 
 /// Cloud Firestore client (online unary operations; P0 scope).
 ///
+/// The default cache-size limit for a local store:
+/// 100 MiB, matching the native SDKs' default persistent
+/// cache threshold.
+pub const DEFAULT_CACHE_SIZE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Options for a local (persistent) store — the caller's
+/// policy knobs. The mechanisms they steer (the mutation
+/// queue, the write pump, garbage collection) live in the
+/// crate; only the policy values live here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalStoreOptions {
+    /// Live-payload size above which the cache garbage
+    /// collector evicts least-recently-accessed documents
+    /// that no open watch targets and no queued mutation
+    /// touches. `None` disables garbage collection (an
+    /// unlimited cache). This is a cleanup threshold, not a
+    /// hard bound: protected documents are never evicted, so
+    /// the store can stay above it.
+    pub cache_size_limit: Option<u64>,
+}
+
+impl Default for LocalStoreOptions {
+    fn default() -> Self {
+        Self {
+            cache_size_limit: Some(DEFAULT_CACHE_SIZE_LIMIT_BYTES),
+        }
+    }
+}
+
+impl LocalStoreOptions {
+    /// Options with garbage collection disabled: the cache
+    /// grows without bound.
+    pub fn unlimited() -> Self {
+        Self {
+            cache_size_limit: None,
+        }
+    }
+}
+
 /// The client holds no token string: every call asks the
 /// [`TokenProvider`] for the current ID token, and on an
 /// `UNAUTHENTICATED` status it forces exactly one refresh and retries
@@ -115,7 +154,22 @@ impl Firestore {
     /// [`Firestore::with_endpoint`] when overriding the endpoint:
     /// the write path captures the endpoint (and shares the gRPC
     /// channel) at this point.
-    pub fn enable_local_store(mut self, path: &std::path::Path) -> Result<Self> {
+    ///
+    /// Equivalent to
+    /// [`Firestore::enable_local_store_with_options`] with
+    /// [`LocalStoreOptions::default`].
+    pub fn enable_local_store(self, path: &std::path::Path) -> Result<Self> {
+        self.enable_local_store_with_options(path, LocalStoreOptions::default())
+    }
+
+    /// Enables local persistence with explicit
+    /// [`LocalStoreOptions`] — currently the cache-size limit
+    /// that drives garbage collection of cached documents.
+    pub fn enable_local_store_with_options(
+        mut self,
+        path: &std::path::Path,
+        options: LocalStoreOptions,
+    ) -> Result<Self> {
         let store = Arc::new(crate::store::LocalStore::open(path)?);
         let write = crate::write::WriteStream::new(
             self.options.clone(),
@@ -123,12 +177,24 @@ impl Firestore {
             self.channel.clone(),
             self.endpoint.clone(),
         );
-        self.engine = Some(Arc::new(crate::engine::PersistenceEngine::new(
-            store,
-            write,
-            self.options.documents_prefix(),
-        )));
+        self.engine = Some(Arc::new(
+            crate::engine::PersistenceEngine::new(store, write, self.options.documents_prefix())
+                .with_cache_size_limit(options.cache_size_limit),
+        ));
         Ok(self)
+    }
+
+    /// The local store's on-disk size in bytes (page-count
+    /// based), or `None` when this client has no local store.
+    /// A read-only fact for display or logging; the cache's
+    /// own garbage collection steers by live payload, so this
+    /// number can stay above the configured limit while freed
+    /// pages await reuse or vacuuming.
+    pub fn local_store_size_bytes(&self) -> Result<Option<u64>> {
+        match &self.engine {
+            Some(engine) => Ok(Some(engine.store().size_bytes()?)),
+            None => Ok(None),
+        }
     }
 
     /// Enqueues one mutation in persistent mode and returns the
@@ -347,10 +413,12 @@ impl Firestore {
             let fetched = self.get_document_online(path).await?;
             if engine.generation() == generation {
                 // Nothing raced the fetch: cache and return as-is.
+                let _landing = engine.landing_guard();
                 match &fetched {
                     Some(document) => engine.store_remote_document(document)?,
                     None => engine.store_remote_absent(path)?,
                 }
+                engine.note_cache_fill();
                 return Ok(fetched);
             }
             // Reconcile conservatively and answer from the current
@@ -359,7 +427,9 @@ impl Firestore {
             // point); a fetched document goes through the engine's
             // reconciliation, which also covers the acknowledged-
             // delete case (no cache row left to compare against).
+            let _landing = engine.landing_guard();
             engine.reconcile_fetched_document(path, fetched.as_ref(), document_generation)?;
+            engine.note_cache_fill();
             return engine.local_document(path);
         }
         self.get_document_online(path).await
@@ -751,9 +821,26 @@ impl Firestore {
                 .await
             {
                 Ok(documents) => {
+                    // Fill + evaluate under the landing guard:
+                    // the fill wakes the garbage collector, and
+                    // a pass must not evict a just-filled
+                    // document before the local evaluation
+                    // reads it back.
+                    let _landing = engine.landing_guard();
                     for document in &documents {
                         engine.store_remote_document(document)?;
                     }
+                    // The refill re-establishes the
+                    // collection's completeness only when the
+                    // server query covered the entire
+                    // collection (the fetch strips pagination,
+                    // but filters and ordering bounds remain),
+                    // and the fill itself is cache growth the
+                    // garbage collector should hear about.
+                    if query.covers_entire_collection() {
+                        engine.note_collection_synced(parent_path, query.collection_id());
+                    }
+                    engine.note_cache_fill();
                     return engine.local_query(parent_path, &query);
                 }
                 Err(error) if crate::listen::is_transient_error(&error) => {
@@ -1096,6 +1183,34 @@ mod tests {
     /// An update against a document with no known local base, while
     /// the server is unreachable, must fail *without* queueing: a
     /// failed operation may not take effect later.
+    #[test]
+    fn local_store_options_and_size_fact() {
+        let app = App::new(FirebaseOptions::new("test-key", "p").with_database_id("d"));
+        // No local store: the size fact is None.
+        let firestore = Firestore::new(&app, Arc::new(StubTokens));
+        assert_eq!(firestore.local_store_size_bytes().unwrap(), None);
+        // With a store: Some(size), and the options carry the
+        // documented defaults.
+        assert_eq!(
+            LocalStoreOptions::default().cache_size_limit,
+            Some(DEFAULT_CACHE_SIZE_LIMIT_BYTES)
+        );
+        assert_eq!(LocalStoreOptions::unlimited().cache_size_limit, None);
+        let dir = std::env::temp_dir().join(format!(
+            "firebase-native-gc-options-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let _ = std::fs::remove_file(&path);
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .enable_local_store_with_options(&path, LocalStoreOptions::unlimited())
+            .unwrap();
+        let size = firestore.local_store_size_bytes().unwrap();
+        assert!(size.is_some_and(|bytes| bytes > 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn persistent_update_without_base_fails_without_queueing() {
         let dir = std::env::temp_dir().join(format!(

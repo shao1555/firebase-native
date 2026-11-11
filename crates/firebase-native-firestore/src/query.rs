@@ -340,6 +340,22 @@ impl Query {
     /// A copy of this query without limit or offset, for
     /// fetching the full candidate set that a local evaluation
     /// then paginates exactly once.
+    /// Whether this query covers its entire collection:
+    /// no filters, no pagination window, and no ordering by
+    /// an ordinary field — ordering bounds the set too,
+    /// because evaluation drops documents that lack the
+    /// ordering field (only `__name__` exists on every
+    /// document). Only a sync of such a query may
+    /// re-establish the collection's completeness after
+    /// garbage collection marked it partial: a partial sync
+    /// legitimately never sees the rest.
+    pub(crate) fn covers_entire_collection(&self) -> bool {
+        self.filters.is_empty()
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && self.orders.iter().all(|order| order.field == "__name__")
+    }
+
     pub(crate) fn without_pagination(&self) -> Query {
         let mut query = self.clone();
         query.limit = None;
@@ -711,6 +727,25 @@ mod tests {
         assert_eq!(query.evaluate(vec![]).len(), 0);
         let candidates = vec![document(&format!("{prefix}a"), &[])];
         assert_eq!(query.evaluate(candidates).len(), 1);
+    }
+
+    #[test]
+    fn covers_entire_collection_requires_no_filters_and_no_window() {
+        assert!(Query::new("notes").covers_entire_collection());
+        assert!(Query::new("notes")
+            .order_by(Order::asc("__name__"))
+            .covers_entire_collection());
+        assert!(
+            !Query::new("notes")
+                .order_by(Order::asc("n"))
+                .covers_entire_collection(),
+            "ordering by an ordinary field drops documents lacking it"
+        );
+        assert!(!Query::new("notes")
+            .filter(Filter::eq("n", Value::Integer(1)))
+            .covers_entire_collection());
+        assert!(!Query::new("notes").limit(1).covers_entire_collection());
+        assert!(!Query::new("notes").offset(1).covers_entire_collection());
     }
 
     #[test]

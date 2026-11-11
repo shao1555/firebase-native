@@ -53,6 +53,25 @@ pub(crate) struct PersistenceEngine {
     /// The most recent permanently rejected batch's error, kept
     /// until a waiter observes it.
     dropped_error: Mutex<Option<String>>,
+    /// Cache-size limit in bytes (live payload), or `None` for
+    /// unlimited. Caller policy, set at construction; the GC
+    /// mechanism itself lives in
+    /// [`PersistenceEngine::collect_garbage_if_needed`].
+    cache_size_limit: Option<u64>,
+    /// Open watches by target key, with a reference count (the
+    /// same target can be watched more than once). A target's
+    /// membership rows are dropped when its last watch closes.
+    active_targets: Mutex<std::collections::HashMap<i64, usize>>,
+    /// Serializes cache *landings* (a watch flushing remote
+    /// changes and registering their membership, a unary
+    /// refill being evaluated) against garbage collection.
+    /// Eviction is atomic in the store, but a document that
+    /// has landed and whose protection has not been recorded
+    /// yet is indistinguishable from an unprotected one —
+    /// landings hold this guard from the first store write
+    /// until protection is recorded, and a collection pass
+    /// holds it for its whole run.
+    gc_guard: Mutex<()>,
 }
 
 impl PersistenceEngine {
@@ -61,6 +80,11 @@ impl PersistenceEngine {
         write: WriteStream,
         documents_prefix: String,
     ) -> Self {
+        // The active-target set is session state (a crashed
+        // predecessor's watches are gone); start empty.
+        // Membership rows stay: they record the baselines the
+        // persisted resume tokens refer to.
+        let _ = store.clear_active_targets();
         Self {
             store,
             write,
@@ -71,7 +95,166 @@ impl PersistenceEngine {
             generation: AtomicU64::new(0),
             document_generations: Mutex::new(std::collections::HashMap::new()),
             dropped_error: Mutex::new(None),
+            cache_size_limit: Some(crate::DEFAULT_CACHE_SIZE_LIMIT_BYTES),
+            active_targets: Mutex::new(std::collections::HashMap::new()),
+            gc_guard: Mutex::new(()),
         }
+    }
+
+    /// The landing/GC serialization guard (see the `gc_guard`
+    /// field). Hold it only across synchronous store work —
+    /// never across an await.
+    pub(crate) fn landing_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gc_guard.lock().expect("gc guard mutex poisoned")
+    }
+
+    /// Sets the cache-size limit (the caller's policy): the
+    /// live-payload threshold for garbage collection, or
+    /// `None` for an unlimited cache.
+    pub(crate) fn with_cache_size_limit(mut self, limit: Option<u64>) -> Self {
+        self.cache_size_limit = limit;
+        self
+    }
+
+    /// Registers an open watch on a target (reference counted:
+    /// the same target may be watched more than once). The
+    /// store-side active set is what eviction consults, inside
+    /// its own transaction.
+    pub(crate) fn register_target(&self, target_key: i64) {
+        let mut targets = self.active_targets.lock().expect("targets mutex poisoned");
+        let count = targets.entry(target_key).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let _ = self.store.put_active_target(target_key);
+        }
+    }
+
+    /// Unregisters a watch; when the last watch on a target
+    /// closes, the target stops being active, so its baseline
+    /// documents become eviction candidates again (evicting
+    /// one then invalidates the target's resume state).
+    pub(crate) fn unregister_target(&self, target_key: i64) {
+        let last = {
+            let mut targets = self.active_targets.lock().expect("targets mutex poisoned");
+            match targets.get_mut(&target_key) {
+                Some(count) => {
+                    *count -= 1;
+                    if *count == 0 {
+                        targets.remove(&target_key);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
+        };
+        if last {
+            let _ = self.store.remove_active_target(target_key);
+        }
+    }
+
+    /// Records that a server sync re-established a
+    /// collection's full contents (a watch reaching a
+    /// consistent point, an online query refill): clears the
+    /// known-partial mark eviction may have set.
+    pub(crate) fn note_collection_synced(&self, parent_relative: &str, collection_id: &str) {
+        let key = Self::collection_key(parent_relative, collection_id);
+        let _ = self.store.clear_collection_incomplete(&key);
+    }
+
+    /// The incomplete-tracking key of a collection: its full
+    /// relative path.
+    pub(crate) fn collection_key(parent_relative: &str, collection_id: &str) -> String {
+        if parent_relative.is_empty() {
+            collection_id.to_string()
+        } else {
+            format!("{parent_relative}/{collection_id}")
+        }
+    }
+
+    /// Notes that a unary read filled the cache (the caller
+    /// is in an async context): makes sure the pump runs and
+    /// wakes it, so idle-time garbage collection also covers
+    /// read-only workloads.
+    pub(crate) fn note_cache_fill(self: &Arc<Self>) {
+        self.ensure_pump();
+        self.wake_pump();
+    }
+
+    /// Records a watch's current view as its target's
+    /// membership (and an access stamp for those documents).
+    pub(crate) fn sync_target_membership(&self, target_key: i64, documents: &[Document]) {
+        let names: Vec<String> = documents.iter().map(|d| d.name.clone()).collect();
+        let _ = self.store.replace_target_membership(target_key, &names);
+    }
+
+    /// One garbage-collection pass, run when the store's file
+    /// size exceeds the configured limit: evicts
+    /// least-recently-accessed cached documents in batches
+    /// until the live payload is at or under the limit.
+    ///
+    /// Protected from eviction: documents belonging to an
+    /// open watch's target, and documents touched by a queued
+    /// mutation. The queue is never touched; a closed target
+    /// whose cached baseline loses a document has its resume
+    /// state invalidated by the eviction itself (its token
+    /// must never be offered against a partial baseline).
+    /// Documents without access bookkeeping sort oldest, so
+    /// lost or inconsistent GC metadata degrades to evicting
+    /// untracked documents first - never to a purge.
+    pub(crate) fn collect_garbage_if_needed(&self) {
+        let Some(limit) = self.cache_size_limit else {
+            return;
+        };
+        // No landing may interleave with a pass: a document
+        // whose protection is about to be recorded must not
+        // be evictable in the meantime.
+        let _guard = self.landing_guard();
+        // Cheap gate first: the live payload cannot exceed
+        // the file that holds it.
+        match self.store.size_bytes() {
+            Ok(size) if size > limit => {}
+            _ => return,
+        }
+        let mut live = match self.store.live_bytes() {
+            Ok(live) => live,
+            Err(_) => return,
+        };
+        if live <= limit {
+            // The payload fits; the file is bloated by freed
+            // pages. Return some to the filesystem where the
+            // database supports it, and stop.
+            self.store.incremental_vacuum(1024);
+            return;
+        }
+        let mut rounds = 0;
+        while live > limit && rounds < 32 {
+            // One atomic round: selection, protection
+            // revalidation and deletion happen inside a
+            // single store transaction, so nothing can slip
+            // past the checks concurrently.
+            let outcome = match self
+                .store
+                .evict_lru_batch(&self.documents_prefix, live - limit)
+            {
+                Ok(outcome) => outcome,
+                // E.g. the queue could not be decoded:
+                // protection that cannot be verified aborts
+                // the pass rather than evicting blind.
+                Err(_) => return,
+            };
+            if outcome.names.is_empty() {
+                break;
+            }
+            for name in &outcome.names {
+                self.bump_document(name);
+            }
+            self.bump_generation();
+            live = live.saturating_sub(outcome.freed_bytes);
+            rounds += 1;
+        }
+        self.store.incremental_vacuum(1024);
     }
 
     /// The underlying store (the sync layer reads and writes
@@ -140,13 +323,21 @@ impl PersistenceEngine {
     /// queue left over from a previous run must drain it even when
     /// nothing new is enqueued. Must be called from a Tokio runtime
     /// context.
-    fn ensure_pump(self: &Arc<Self>) {
+    pub(crate) fn ensure_pump(self: &Arc<Self>) {
         if !self.pump_started.swap(true, Ordering::SeqCst) {
             let engine = Arc::clone(self);
             tokio::spawn(async move {
                 engine.pump().await;
             });
         }
+    }
+
+    /// Wakes the pump (a no-op when it is not running). Watch
+    /// drivers call this after landing remote changes, so the
+    /// idle-pump housekeeping (garbage collection) also runs
+    /// for watch-only workloads.
+    pub(crate) fn wake_pump(&self) {
+        self.queue_changed.notify_waiters();
     }
 
     /// Appends one batch to the queue and ensures the pump is
@@ -177,6 +368,9 @@ impl PersistenceEngine {
                 }
             };
             let Some(batch) = batches.into_iter().next() else {
+                // The queue is empty and the pump is idle: the
+                // natural moment for cache housekeeping.
+                self.collect_garbage_if_needed();
                 notified.await;
                 continue;
             };
@@ -320,6 +514,13 @@ impl PersistenceEngine {
                     }
                 }
             }
+        }
+        if let Some(document) = &current {
+            // A cache read is an access for LRU purposes.
+            // Best effort: bookkeeping must not fail the read.
+            let _ = self
+                .store
+                .touch_access(std::slice::from_ref(&document.name));
         }
         Ok(current)
     }
@@ -494,6 +695,15 @@ impl PersistenceEngine {
         parent_relative: &str,
         collection_id: &str,
     ) -> Result<bool> {
+        // A collection eviction cut into is known-partial:
+        // the local view must not be trusted as complete
+        // until a server sync refills it.
+        if self
+            .store
+            .collection_incomplete(&Self::collection_key(parent_relative, collection_id))?
+        {
+            return Ok(false);
+        }
         let prefix = Self::collection_prefix(parent_relative, collection_id);
         for document in self.store.all_remote_documents()? {
             if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
@@ -642,6 +852,302 @@ mod tests {
             write,
             "projects/p/databases/d/documents".to_string(),
         ))
+    }
+
+    fn gc_engine(limit: Option<u64>) -> Arc<PersistenceEngine> {
+        let store = Arc::new(LocalStore::open_in_memory().unwrap());
+        let options = firebase_native_core::FirebaseOptions {
+            api_key: "test".to_string(),
+            project_id: "p".to_string(),
+            auth_domain: None,
+            storage_bucket: None,
+            app_id: None,
+            database_id: "d".to_string(),
+        };
+        let write = WriteStream::new(
+            options,
+            Arc::new(StubTokens),
+            Arc::new(tokio::sync::OnceCell::new()),
+            "https://firestore.googleapis.com".to_string(),
+        );
+        Arc::new(
+            PersistenceEngine::new(store, write, "projects/p/databases/d/documents".to_string())
+                .with_cache_size_limit(limit),
+        )
+    }
+
+    /// A cached document whose payload is roughly `payload`
+    /// bytes of string data (plus proto overhead).
+    fn big_remote_doc(relative: &str, payload: usize) -> Document {
+        let mut fields = Fields::new();
+        fields.insert("blob".to_string(), Value::String("x".repeat(payload)));
+        Document {
+            name: format!("projects/p/databases/d/documents/{relative}"),
+            fields,
+            create_time: None,
+            update_time: Some(crate::value::Timestamp::new(10, 0)),
+        }
+    }
+
+    fn cached(engine: &PersistenceEngine, relative: &str) -> bool {
+        engine
+            .store()
+            .remote_document(&format!("projects/p/databases/d/documents/{relative}"))
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn gc_evicts_least_recently_accessed_first() {
+        // ~1070-byte payloads (1000 bytes of string + proto
+        // overhead); a 2500-byte limit fits two, not three.
+        let engine = gc_engine(Some(2500));
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/c", 1000))
+            .unwrap();
+        // Reading a makes it the most recently accessed.
+        assert!(engine.local_document("notes/a").unwrap().is_some());
+        engine.collect_garbage_if_needed();
+        assert!(!cached(&engine, "notes/b"), "oldest access goes first");
+        assert!(
+            cached(&engine, "notes/a"),
+            "just read: protected by recency"
+        );
+        assert!(cached(&engine, "notes/c"));
+        assert!(engine.store().live_bytes().unwrap() <= 2500);
+    }
+
+    #[test]
+    fn gc_never_evicts_documents_in_an_open_target() {
+        let engine = gc_engine(Some(600));
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 250))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 250))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/c", 250))
+            .unwrap();
+        // An open watch targets a (the least recently accessed).
+        engine.register_target(42);
+        let view = vec![big_remote_doc("notes/a", 250)];
+        engine.sync_target_membership(42, &view);
+        // Syncing membership stamps a as accessed; make b the
+        // newest instead, so only membership can save a.
+        assert!(engine.local_document("notes/b").unwrap().is_some());
+        engine.collect_garbage_if_needed();
+        assert!(cached(&engine, "notes/a"), "in an open target: protected");
+        // Once the watch closes, protection ends: push the
+        // store back over the limit and a is evicted.
+        engine.unregister_target(42);
+        engine
+            .store_remote_document(&big_remote_doc("notes/d", 250))
+            .unwrap();
+        engine.collect_garbage_if_needed();
+        assert!(!cached(&engine, "notes/a"));
+    }
+
+    #[test]
+    fn gc_never_evicts_documents_with_pending_mutations() {
+        let engine = gc_engine(Some(600));
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 250))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 250))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/c", 250))
+            .unwrap();
+        // A queued (unacknowledged) write touches a.
+        let mut fields = Fields::new();
+        fields.insert("n".to_string(), Value::Integer(1));
+        engine
+            .store()
+            .enqueue_batch(&[Mutation::Set {
+                path: "notes/a".to_string(),
+                fields,
+                merge_paths: None,
+                exists: None,
+                transforms: Vec::new(),
+            }])
+            .unwrap();
+        engine.collect_garbage_if_needed();
+        assert!(cached(&engine, "notes/a"), "pending write: protected");
+        assert_eq!(engine.store().batch_count().unwrap(), 1, "queue untouched");
+    }
+
+    #[test]
+    fn gc_invalidates_resume_state_and_marks_the_collection_incomplete() {
+        let engine = gc_engine(Some(2500));
+        let a = big_remote_doc("notes/a", 1000);
+        let b = big_remote_doc("notes/b", 1000);
+        let c = big_remote_doc("notes/c", 1000);
+        engine.store_remote_document(&a).unwrap();
+        engine.store_remote_document(&b).unwrap();
+        engine.store_remote_document(&c).unwrap();
+        // A watch on all three opens and closes, leaving its
+        // membership as the baseline its resume token (saved
+        // in the store) refers to.
+        engine.register_target(42);
+        engine.sync_target_membership(42, &[a.clone(), b.clone(), c.clone()]);
+        engine
+            .store()
+            .put_target_state(
+                42,
+                &crate::store::TargetState {
+                    resume_token: vec![1, 2, 3],
+                    snapshot_version: None,
+                },
+            )
+            .unwrap();
+        engine.unregister_target(42);
+        assert!(engine.collection_known("", "notes").unwrap());
+        engine.collect_garbage_if_needed();
+        // a (LRU) was evicted: the baseline is broken, so the
+        // resume token must be gone, and the collection must
+        // no longer count as known-complete.
+        assert!(!cached(&engine, "notes/a"));
+        assert!(engine.store().target_state(42).unwrap().is_none());
+        assert!(!engine.collection_known("", "notes").unwrap());
+        // A server sync re-establishes completeness.
+        engine.note_collection_synced("", "notes");
+        assert!(engine.collection_known("", "notes").unwrap());
+    }
+
+    #[tokio::test]
+    async fn gc_runs_from_the_pump_after_a_unary_cache_fill() {
+        // Read-only workloads never enqueue; the fill hook
+        // starts and wakes the pump, whose idle moment runs
+        // the collection.
+        let engine = gc_engine(Some(2500));
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/c", 1000))
+            .unwrap();
+        assert!(engine.store().live_bytes().unwrap() > 2500);
+        engine.note_cache_fill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.store().live_bytes().unwrap() > 2500 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pump-driven GC did not run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[test]
+    fn gc_cannot_run_during_a_landing() {
+        let engine = gc_engine(Some(2500));
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 1000))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/c", 1000))
+            .unwrap();
+        // While a landing holds the guard, a collection pass
+        // on another thread must wait — a just-landed document
+        // whose membership is not yet recorded is
+        // indistinguishable from an unprotected one.
+        let guard = engine.landing_guard();
+        let gc_engine = engine.clone();
+        let handle = std::thread::spawn(move || gc_engine.collect_garbage_if_needed());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(cached(&engine, "notes/a"), "GC must wait out the landing");
+        drop(guard);
+        handle.join().unwrap();
+        assert!(
+            !cached(&engine, "notes/a"),
+            "GC runs once the landing completes"
+        );
+    }
+
+    #[test]
+    fn gc_is_disabled_when_unlimited() {
+        let engine = gc_engine(None);
+        engine
+            .store_remote_document(&big_remote_doc("notes/a", 250))
+            .unwrap();
+        engine
+            .store_remote_document(&big_remote_doc("notes/b", 250))
+            .unwrap();
+        engine.collect_garbage_if_needed();
+        assert!(cached(&engine, "notes/a"));
+        assert!(cached(&engine, "notes/b"));
+    }
+
+    #[test]
+    fn gc_evicts_untracked_documents_first() {
+        // Simulate bookkeeping loss: a document with no access
+        // row must be treated as the oldest, ahead of tracked
+        // documents - never as a reason to purge.
+        let dir =
+            std::env::temp_dir().join(format!("firebase-native-gc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(LocalStore::open(&path).unwrap());
+        store
+            .put_remote_document(&big_remote_doc("notes/tracked", 250))
+            .unwrap();
+        store
+            .put_remote_document(&big_remote_doc("notes/untracked", 250))
+            .unwrap();
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute(
+                "DELETE FROM document_access WHERE name LIKE '%untracked'",
+                [],
+            )
+            .unwrap();
+        }
+        let options = firebase_native_core::FirebaseOptions {
+            api_key: "test".to_string(),
+            project_id: "p".to_string(),
+            auth_domain: None,
+            storage_bucket: None,
+            app_id: None,
+            database_id: "d".to_string(),
+        };
+        let write = WriteStream::new(
+            options,
+            Arc::new(StubTokens),
+            Arc::new(tokio::sync::OnceCell::new()),
+            "https://firestore.googleapis.com".to_string(),
+        );
+        let engine = Arc::new(
+            PersistenceEngine::new(store, write, "projects/p/databases/d/documents".to_string())
+                .with_cache_size_limit(Some(400)),
+        );
+        engine
+            .store_remote_document(&big_remote_doc("notes/newest", 250))
+            .unwrap();
+        engine.collect_garbage_if_needed();
+        assert!(
+            engine
+                .store()
+                .remote_document("projects/p/databases/d/documents/notes/untracked")
+                .unwrap()
+                .is_none(),
+            "untracked sorts oldest and is evicted first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn set(path: &str, n: i64) -> Mutation {

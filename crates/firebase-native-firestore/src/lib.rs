@@ -89,7 +89,9 @@ mod store;
 mod value;
 mod write;
 
-pub use client::{Firestore, ListDocumentsResult};
+pub use client::{
+    Firestore, ListDocumentsResult, LocalStoreOptions, DEFAULT_CACHE_SIZE_LIMIT_BYTES,
+};
 pub use listen::{DocumentChange, DocumentChangeKind, Listener, Snapshot, SnapshotMetadata};
 pub use path::{collection_path_of, document_id_of, is_collection_path, is_document_path};
 pub use query::{FieldOp, Filter, Order, Query, UnaryOp};

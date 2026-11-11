@@ -901,10 +901,39 @@ impl StoreWatch {
         source: WatchSource,
         target_key: i64,
     ) -> Self {
+        engine.register_target(target_key);
         Self {
             engine,
             source,
             target_key,
+        }
+    }
+
+    /// Records `documents` (this watch's current view) as the
+    /// target's membership with the engine, protecting them
+    /// from cache garbage collection while the watch is open.
+    /// `from_server` marks syncs that reflect server state (a
+    /// consistent point, not the cache-only seed): for a query
+    /// watch they also re-establish the collection's
+    /// completeness after any eviction.
+    fn sync_membership(&self, documents: &[Document], from_server: bool) {
+        self.engine
+            .sync_target_membership(self.target_key, documents);
+        if from_server {
+            if let WatchSource::Query {
+                parent_relative,
+                query,
+            } = &self.source
+            {
+                // Only a sync covering the *entire* collection
+                // re-establishes its completeness: a filtered
+                // or windowed watch legitimately never sees
+                // the documents eviction may have taken.
+                if query.covers_entire_collection() {
+                    self.engine
+                        .note_collection_synced(parent_relative, query.collection_id());
+                }
+            }
         }
     }
 
@@ -930,6 +959,11 @@ impl StoreWatch {
     /// the target's persisted resume token, if any. Returns the
     /// seeded documents (the state view's baseline).
     fn seed(&self, state: &mut WatchState) -> Vec<Document> {
+        // The composed view and the membership registration
+        // must be atomic against garbage collection: a
+        // document the seed just read must not be evicted
+        // before its protection lands.
+        let _landing = self.engine.landing_guard();
         let documents = self.composed().unwrap_or_default();
         let token = self
             .engine
@@ -943,6 +977,7 @@ impl StoreWatch {
             state.restore_resume_token(token.clone());
         }
         state.seed_view(documents.clone(), token.is_none());
+        self.sync_membership(&documents, false);
         documents
     }
 
@@ -989,6 +1024,15 @@ impl StoreWatch {
                 snapshot_version: read_time,
             },
         );
+    }
+}
+
+impl Drop for StoreWatch {
+    fn drop(&mut self) {
+        // The watch is gone: its documents stop being
+        // protected from garbage collection (the engine
+        // reference-counts watches per target).
+        self.engine.unregister_target(self.target_key);
     }
 }
 
@@ -1356,6 +1400,10 @@ async fn run_watch(
     let mut delivery = StoreDelivery::new();
     let mut last_state_docs: Vec<Document> = Vec::new();
     if let Some(watch) = &store_watch {
+        // A watch-only workload may never enqueue a write, so
+        // make sure the pump (and with it idle-time garbage
+        // collection) is running for this engine.
+        watch.engine.ensure_pump();
         last_state_docs = watch.seed(&mut state);
         if !delivery.emit(watch, &sender, true).await {
             return;
@@ -1579,17 +1627,29 @@ async fn run_watch(
                             ResponseAction::Deliver(snapshot) => {
                                 backoff.reset();
                                 if let Some(watch) = &store_watch {
-                                    reconcile_view_removals(
-                                        watch,
-                                        &last_state_docs,
-                                        &snapshot.documents,
-                                        &buffer,
-                                        &view_only,
-                                        snapshot.read_time.as_ref(),
-                                    );
-                                    flush_remote(&watch.engine, &mut buffer);
-                                    view_only.clear();
-                                    watch.persist_target(&state, snapshot.read_time);
+                                    // Landing is serialized
+                                    // against garbage
+                                    // collection: the flushed
+                                    // documents are protected
+                                    // only once their membership
+                                    // is recorded, and no pass
+                                    // may run in between.
+                                    {
+                                        let _landing = watch.engine.landing_guard();
+                                        reconcile_view_removals(
+                                            watch,
+                                            &last_state_docs,
+                                            &snapshot.documents,
+                                            &buffer,
+                                            &view_only,
+                                            snapshot.read_time.as_ref(),
+                                        );
+                                        flush_remote(&watch.engine, &mut buffer);
+                                        view_only.clear();
+                                        watch.persist_target(&state, snapshot.read_time);
+                                        watch.sync_membership(&snapshot.documents, true);
+                                        watch.engine.wake_pump();
+                                    }
                                     last_state_docs = snapshot.documents.clone();
                                     delivery.last_read_time = snapshot.read_time;
                                     if !delivery.emit(watch, &sender, !state.is_current()).await {
@@ -1609,31 +1669,40 @@ async fn run_watch(
                                     // the store through the same
                                     // reconciliation as an ordinary
                                     // delivery; the event's own puts
-                                    // still land.
-                                    reconcile_view_removals(
-                                        watch,
-                                        &last_state_docs,
-                                        snapshot
-                                            .as_ref()
-                                            .map(|snapshot| snapshot.documents.as_slice())
-                                            .unwrap_or(&[]),
-                                        &buffer,
-                                        &view_only,
-                                        snapshot
-                                            .as_ref()
-                                            .and_then(|snapshot| snapshot.read_time.as_ref()),
-                                    );
-                                    flush_remote(&watch.engine, &mut buffer);
-                                    view_only.clear();
-                                    watch.persist_target(
-                                        &state,
-                                        snapshot.as_ref().and_then(|snapshot| snapshot.read_time),
-                                    );
-                                    if let Some(snapshot) = &snapshot {
-                                        delivery.last_read_time = snapshot.read_time;
-                                        last_state_docs = snapshot.documents.clone();
-                                    } else {
-                                        last_state_docs.clear();
+                                    // still land. (Landing/GC
+                                    // serialization as in the
+                                    // Deliver branch.)
+                                    {
+                                        let _landing = watch.engine.landing_guard();
+                                        reconcile_view_removals(
+                                            watch,
+                                            &last_state_docs,
+                                            snapshot
+                                                .as_ref()
+                                                .map(|snapshot| snapshot.documents.as_slice())
+                                                .unwrap_or(&[]),
+                                            &buffer,
+                                            &view_only,
+                                            snapshot
+                                                .as_ref()
+                                                .and_then(|snapshot| snapshot.read_time.as_ref()),
+                                        );
+                                        flush_remote(&watch.engine, &mut buffer);
+                                        view_only.clear();
+                                        watch.persist_target(
+                                            &state,
+                                            snapshot
+                                                .as_ref()
+                                                .and_then(|snapshot| snapshot.read_time),
+                                        );
+                                        if let Some(snapshot) = &snapshot {
+                                            delivery.last_read_time = snapshot.read_time;
+                                            last_state_docs = snapshot.documents.clone();
+                                        } else {
+                                            last_state_docs.clear();
+                                        }
+                                        watch.sync_membership(&last_state_docs, true);
+                                        watch.engine.wake_pump();
                                     }
                                     if !delivery.emit(watch, &sender, !state.is_current()).await {
                                         return;
@@ -1657,8 +1726,12 @@ async fn run_watch(
                                 // is not accepted and flushes nothing.)
                                 if accepted {
                                     if let Some(watch) = &store_watch {
+                                        let _landing = watch.engine.landing_guard();
                                         flush_remote(&watch.engine, &mut buffer);
                                         view_only.clear();
+                                        let view = state.effective_view();
+                                        watch.sync_membership(&view, true);
+                                        watch.engine.wake_pump();
                                     }
                                 }
                             }
@@ -3103,6 +3176,68 @@ mod tests {
             42,
         );
         (engine, watch)
+    }
+
+    #[test]
+    fn filtered_watch_sync_does_not_clear_collection_incompleteness() {
+        // An engine whose limit fits two of three ~1 KiB
+        // documents, so a collection pass cuts the collection.
+        let store = Arc::new(crate::store::LocalStore::open_in_memory().unwrap());
+        let options = FirebaseOptions::new("test-key", "p");
+        let write = crate::write::WriteStream::new(
+            options.clone(),
+            Arc::new(StubTokens),
+            Arc::new(tokio::sync::OnceCell::new()),
+            "https://firestore.googleapis.com".to_string(),
+        );
+        let engine = Arc::new(
+            PersistenceEngine::new(store, write, PREFIX.to_string())
+                .with_cache_size_limit(Some(2500)),
+        );
+        let big = |name: &str| {
+            let mut fields = Fields::new();
+            fields.insert("blob".to_string(), Value::String("x".repeat(1000)));
+            Document {
+                name: format!("{PREFIX}/{name}"),
+                fields,
+                create_time: None,
+                update_time: Some(Timestamp::new(10, 0)),
+            }
+        };
+        engine.store_remote_document(&big("notes/a")).unwrap();
+        engine.store_remote_document(&big("notes/b")).unwrap();
+        engine.store_remote_document(&big("notes/c")).unwrap();
+        engine.collect_garbage_if_needed();
+        assert!(
+            !engine.collection_known("", "notes").unwrap(),
+            "eviction marked the collection incomplete"
+        );
+        // A filtered watch syncs only its own result set: the
+        // collection-wide mark must survive it.
+        let filtered = StoreWatch::new(
+            engine.clone(),
+            WatchSource::Query {
+                parent_relative: String::new(),
+                query: Query::new("notes").filter(crate::query::Filter::eq("n", Value::Integer(2))),
+            },
+            43,
+        );
+        filtered.sync_membership(std::slice::from_ref(&big("notes/b")), true);
+        assert!(
+            !engine.collection_known("", "notes").unwrap(),
+            "a filtered sync must not clear the mark"
+        );
+        // An unfiltered, unbounded watch sync does clear it.
+        let full = StoreWatch::new(
+            engine.clone(),
+            WatchSource::Query {
+                parent_relative: String::new(),
+                query: Query::new("notes"),
+            },
+            44,
+        );
+        full.sync_membership(&[big("notes/b"), big("notes/c")], true);
+        assert!(engine.collection_known("", "notes").unwrap());
     }
 
     fn stored_doc(name: &str, n: i64) -> Document {
