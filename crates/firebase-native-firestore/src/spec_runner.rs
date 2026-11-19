@@ -1605,7 +1605,7 @@ impl Harness {
         let write = WriteStream::new(
             options,
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         let store = Arc::new(LocalStore::open_in_memory().expect("in-memory store"));

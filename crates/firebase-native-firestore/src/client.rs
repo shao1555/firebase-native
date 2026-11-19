@@ -124,7 +124,7 @@ pub struct Firestore {
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
     endpoint: String,
-    channel: Arc<tokio::sync::OnceCell<Channel>>,
+    channel: Arc<SharedChannel>,
     /// The persistence engine, when local persistence is enabled
     /// via [`Firestore::with_local_store`].
     engine: Option<Arc<crate::engine::PersistenceEngine>>,
@@ -138,7 +138,7 @@ impl Firestore {
             options: app.options().clone(),
             tokens,
             endpoint: DEFAULT_ENDPOINT.to_string(),
-            channel: Arc::new(tokio::sync::OnceCell::new()),
+            channel: Arc::new(SharedChannel::new()),
             engine: None,
         }
     }
@@ -238,22 +238,14 @@ impl Firestore {
         self
     }
 
-    async fn channel(&self) -> Result<Channel> {
-        let channel = self
-            .channel
-            .get_or_try_init(|| build_channel(&self.endpoint))
-            .await?;
-        Ok(channel.clone())
+    async fn channel(&self) -> Result<(Channel, u64)> {
+        self.channel.get(&self.endpoint).await
     }
 
-    async fn client(&self, force_refresh: bool) -> Result<FirestoreClient<AuthService>> {
-        grpc_client(
-            self.channel().await?,
-            &self.options,
-            &self.tokens,
-            force_refresh,
-        )
-        .await
+    async fn client(&self, force_refresh: bool) -> Result<(FirestoreClient<AuthService>, u64)> {
+        let (channel, generation) = self.channel().await?;
+        let client = grpc_client(channel, &self.options, &self.tokens, force_refresh).await?;
+        Ok((client, generation))
     }
 
     /// Runs `op` with an authenticated client. On `UNAUTHENTICATED`,
@@ -265,13 +257,29 @@ impl Firestore {
     {
         let mut force_refresh = false;
         loop {
-            let client = self.client(force_refresh).await?;
-            match op(client).await {
-                Ok(value) => return Ok(value),
-                Err(status) if status.code() == Code::Unauthenticated && !force_refresh => {
+            let (client, generation) = self.client(force_refresh).await?;
+            match tokio::time::timeout(UNARY_CALL_TIMEOUT, op(client)).await {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(status)) if status.code() == Code::Unauthenticated && !force_refresh => {
                     force_refresh = true;
                 }
-                Err(status) => return Err(map_status(status)),
+                Ok(Err(status)) if !is_request_deadline_expired(&status) => {
+                    return Err(map_status(status));
+                }
+                _ => {
+                    // The call hung, by either clock: this
+                    // wrapper's, or tonic's own enforcement of
+                    // the request's grpc-timeout (which reports
+                    // as Cancelled / "Timeout expired" and can
+                    // win the race). Rebuild the generation so
+                    // the next call dials fresh, and fail
+                    // transiently (see UNARY_CALL_TIMEOUT).
+                    let _ = self.channel.refresh(&self.endpoint, generation).await;
+                    return Err(Error::Rpc {
+                        code: "DeadlineExceeded".to_string(),
+                        message: "unary call timed out".to_string(),
+                    });
+                }
             }
         }
     }
@@ -335,9 +343,11 @@ impl Firestore {
                 target_key(&target),
             )
         });
-        let channel = self.channel().await?;
+        let (channel, generation) = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
+            generation,
+            self.channel.clone(),
             self.endpoint.clone(),
             self.options.clone(),
             self.tokens.clone(),
@@ -374,9 +384,11 @@ impl Firestore {
                 target_key(&target),
             )
         });
-        let channel = self.channel().await?;
+        let (channel, generation) = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
+            generation,
+            self.channel.clone(),
             self.endpoint.clone(),
             self.options.clone(),
             self.tokens.clone(),
@@ -443,13 +455,15 @@ impl Firestore {
             .call(move |mut client| {
                 let name = name.clone();
                 async move {
+                    let mut request = tonic::Request::new(GetDocumentRequest {
+                        name,
+                        mask: None,
+                        consistency_selector: None,
+                        request_options: None,
+                    });
+                    request.set_timeout(UNARY_CALL_TIMEOUT);
                     client
-                        .get_document(GetDocumentRequest {
-                            name,
-                            mask: None,
-                            consistency_selector: None,
-                            request_options: None,
-                        })
+                        .get_document(request)
                         .await
                         .map(|response| response.into_inner())
                 }
@@ -503,15 +517,17 @@ impl Firestore {
                 let collection_id = collection_id.clone();
                 let document = proto_document.clone();
                 async move {
+                    let mut request = tonic::Request::new(CreateDocumentRequest {
+                        parent,
+                        collection_id,
+                        document_id: document_id.unwrap_or_default().to_string(),
+                        document: Some(document),
+                        mask: None,
+                        request_options: None,
+                    });
+                    request.set_timeout(UNARY_CALL_TIMEOUT);
                     client
-                        .create_document(CreateDocumentRequest {
-                            parent,
-                            collection_id,
-                            document_id: document_id.unwrap_or_default().to_string(),
-                            document: Some(document),
-                            mask: None,
-                            request_options: None,
-                        })
+                        .create_document(request)
                         .await
                         .map(|response| response.into_inner())
                 }
@@ -617,15 +633,14 @@ impl Firestore {
             let database = database.clone();
             let write = write.clone();
             async move {
-                client
-                    .commit(CommitRequest {
-                        database,
-                        writes: vec![write],
-                        transaction: Vec::new(),
-                        request_options: None,
-                    })
-                    .await
-                    .map(|_| ())
+                let mut request = tonic::Request::new(CommitRequest {
+                    database,
+                    writes: vec![write],
+                    transaction: Vec::new(),
+                    request_options: None,
+                });
+                request.set_timeout(UNARY_CALL_TIMEOUT);
+                client.commit(request).await.map(|_| ())
             }
         })
         .await
@@ -708,14 +723,16 @@ impl Firestore {
                 let document = proto_document.clone();
                 let field_paths = field_paths.clone();
                 async move {
+                    let mut request = tonic::Request::new(UpdateDocumentRequest {
+                        document: Some(document),
+                        update_mask: Some(DocumentMask { field_paths }),
+                        mask: None,
+                        current_document: None,
+                        request_options: None,
+                    });
+                    request.set_timeout(UNARY_CALL_TIMEOUT);
                     client
-                        .update_document(UpdateDocumentRequest {
-                            document: Some(document),
-                            update_mask: Some(DocumentMask { field_paths }),
-                            mask: None,
-                            current_document: None,
-                            request_options: None,
-                        })
+                        .update_document(request)
                         .await
                         .map(|response| response.into_inner())
                 }
@@ -737,14 +754,13 @@ impl Firestore {
         self.call(move |mut client| {
             let name = name.clone();
             async move {
-                client
-                    .delete_document(DeleteDocumentRequest {
-                        name,
-                        current_document: None,
-                        request_options: None,
-                    })
-                    .await
-                    .map(|_| ())
+                let mut request = tonic::Request::new(DeleteDocumentRequest {
+                    name,
+                    current_document: None,
+                    request_options: None,
+                });
+                request.set_timeout(UNARY_CALL_TIMEOUT);
+                client.delete_document(request).await.map(|_| ())
             }
         })
         .await
@@ -766,18 +782,20 @@ impl Firestore {
                 let collection_id = collection_id.clone();
                 let page_token = page_token.clone();
                 async move {
+                    let mut request = tonic::Request::new(ListDocumentsRequest {
+                        parent,
+                        collection_id,
+                        page_size: page_size.unwrap_or(0),
+                        page_token: page_token.unwrap_or_default(),
+                        mask: None,
+                        consistency_selector: None,
+                        order_by: String::new(),
+                        show_missing: false,
+                        request_options: None,
+                    });
+                    request.set_timeout(UNARY_CALL_TIMEOUT);
                     client
-                        .list_documents(ListDocumentsRequest {
-                            parent,
-                            collection_id,
-                            page_size: page_size.unwrap_or(0),
-                            page_token: page_token.unwrap_or_default(),
-                            mask: None,
-                            consistency_selector: None,
-                            order_by: String::new(),
-                            show_missing: false,
-                            request_options: None,
-                        })
+                        .list_documents(request)
                         .await
                         .map(|response| response.into_inner())
                 }
@@ -867,19 +885,19 @@ impl Firestore {
                 let parent = parent.clone();
                 let structured = structured.clone();
                 async move {
-                    let response = client
-                        .run_query(RunQueryRequest {
-                            parent,
-                            query_type: Some(
-                                crate::google::firestore::v1::run_query_request::QueryType::StructuredQuery(
-                                    structured,
-                                ),
+                    let mut request = tonic::Request::new(RunQueryRequest {
+                        parent,
+                        query_type: Some(
+                            crate::google::firestore::v1::run_query_request::QueryType::StructuredQuery(
+                                structured,
                             ),
-                            consistency_selector: None,
-                            explain_options: None,
-                            request_options: None,
-                        })
-                        .await?;
+                        ),
+                        consistency_selector: None,
+                        explain_options: None,
+                        request_options: None,
+                    });
+                    request.set_timeout(UNARY_CALL_TIMEOUT);
+                    let response = client.run_query(request).await?;
                     let mut stream = response.into_inner();
                     let mut out = Vec::new();
                     while let Some(item) = stream.message().await? {
@@ -1054,6 +1072,18 @@ fn target_key(target: &crate::google::firestore::v1::Target) -> i64 {
     hasher.finish() as i64
 }
 
+/// Whether a status is tonic's local enforcement of a
+/// request deadline (the `grpc-timeout` every unary request
+/// carries): when the deadline passes, tonic cancels the
+/// call itself with exactly this shape. Matched explicitly
+/// so a cancellation sent by the server keeps its own
+/// meaning. (If a future tonic changes the message, the
+/// wrapper timeout in `Firestore::call` still bounds the
+/// call; only the generation refresh would be skipped.)
+fn is_request_deadline_expired(status: &Status) -> bool {
+    status.code() == Code::Cancelled && status.message() == "Timeout expired"
+}
+
 /// Maps a gRPC status onto the shared error type.
 pub(crate) fn map_status(status: Status) -> Error {
     let message = status.message().to_string();
@@ -1069,11 +1099,149 @@ pub(crate) fn map_status(status: Status) -> Error {
     }
 }
 
+/// How long opening a streaming RPC (Listen or Write) may
+/// take before the attempt is abandoned as hung. The connect
+/// timeout bounds TCP/TLS only and keepalive starts once an
+/// HTTP/2 connection exists, so neither bounds an open
+/// stalled in the handshake that follows (issues #25 and
+/// #27). An abandoned open marks its channel generation for
+/// rebuild (see [`SharedChannel`]).
+///
+/// Deliberately longer than [`CONNECT_TIMEOUT`], so the two
+/// bounds never race: a connect that stalls is resolved by
+/// the connect timeout's error — an ordinary failure, after
+/// which tonic redials — while a handshake that stalls
+/// after connecting is resolved here, by the rebuild.
+#[cfg(not(test))]
+pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Test scale. The stall tests originally ran on tokio's
+/// paused clock, but that races real network I/O: when the
+/// runtime idles before a real TCP connect completes, the
+/// virtual clock jumps straight to the connect deadline and
+/// the attempt ends as an ordinary connect error instead of
+/// exercising the open deadline (this is how CI caught it).
+/// On real time the loopback connect completes in
+/// milliseconds, far inside even the scaled bounds, so each
+/// mechanism fires deterministically — at the price of the
+/// stall tests taking about a second each.
+#[cfg(test)]
+pub(crate) const STREAM_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// How long one unary call (through [`Firestore::call`]) may
+/// take before it is abandoned as hung. A unary call on a
+/// connection stalled in the HTTP/2 handshake otherwise never
+/// returns — keepalive cannot help, because that connection
+/// never became an HTTP/2 connection — and a hang is not an
+/// error, so the local-store fallback of the persistent
+/// reads would never run. On expiry the channel generation
+/// is rebuilt and the call fails with a transient
+/// `DeadlineExceeded`, which is exactly the signal the
+/// fallback keys on (issue #27). Longer than
+/// [`STREAM_OPEN_TIMEOUT`] because the bound covers the
+/// whole call, and `run_query` reads its entire result
+/// stream inside it.
+///
+/// The same bound is sent to the server as each request's
+/// gRPC deadline, so the server abandons the call at the
+/// same moment instead of completing work nobody is waiting
+/// for. Two consequences callers should know: a write whose
+/// deadline expires may still have been applied, if the
+/// server committed it just before the deadline — the error
+/// is transient, so a retried create surfaces as
+/// `AlreadyExists` — and `run_query` is bounded as a whole,
+/// so a very large result on a slow link can time out and
+/// fall back to the local store rather than arriving late.
+#[cfg(not(test))]
+const UNARY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Test scale (see [`STREAM_OPEN_TIMEOUT`]).
+#[cfg(test)]
+const UNARY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A gRPC channel shared by every part of a client — unary
+/// calls, the Listen driver and the Write stream — together
+/// with a generation counter.
+///
+/// Sharing one channel is the normal state: one connection,
+/// multiplexed streams, as in the official SDKs. The
+/// generation exists for one failure shape (issue #27): a
+/// connection that hangs mid-handshake stays the channel's
+/// only connection, and every later attempt queues behind
+/// it. A component that abandons such an attempt calls
+/// [`SharedChannel::refresh`], which swaps in a freshly
+/// built channel when — and only when — the generation it
+/// was using is still current: concurrent failures race to
+/// rebuild, exactly one wins, and the rest adopt the new
+/// channel on their next fetch. Users still holding the old
+/// channel keep their clone; its connection closes when the
+/// last of them finishes.
+pub(crate) struct SharedChannel {
+    state: tokio::sync::Mutex<SharedChannelState>,
+}
+
+struct SharedChannelState {
+    channel: Option<Channel>,
+    generation: u64,
+}
+
+impl SharedChannel {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(SharedChannelState {
+                channel: None,
+                generation: 0,
+            }),
+        }
+    }
+
+    /// The current channel and its generation, building the
+    /// first channel on demand. A build error reaches the
+    /// caller that needed the channel (the fail-fast
+    /// behaviour watch creation has always had).
+    pub(crate) async fn get(&self, endpoint: &str) -> Result<(Channel, u64)> {
+        let mut state = self.state.lock().await;
+        if state.channel.is_none() {
+            state.channel = Some(build_channel(endpoint).await?);
+        }
+        Ok((
+            state.channel.clone().expect("channel just ensured"),
+            state.generation,
+        ))
+    }
+
+    /// Rebuilds the channel when `used_generation` is still
+    /// current, and returns the current channel and
+    /// generation either way: when another component already
+    /// rebuilt, the caller simply adopts the fresh channel.
+    pub(crate) async fn refresh(
+        &self,
+        endpoint: &str,
+        used_generation: u64,
+    ) -> Result<(Channel, u64)> {
+        let mut state = self.state.lock().await;
+        if state.channel.is_none() || state.generation == used_generation {
+            let rebuilt = build_channel(endpoint).await?;
+            if state.channel.is_some() {
+                state.generation += 1;
+            }
+            state.channel = Some(rebuilt);
+        }
+        Ok((
+            state.channel.clone().expect("channel just ensured"),
+            state.generation,
+        ))
+    }
+}
+
 /// How long establishing one connection may take before the
 /// attempt is abandoned. Bounds a connect on a network that
 /// silently drops packets, which otherwise hangs until the OS
 /// gives up (issue #25).
+#[cfg(not(test))]
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Test scale: the stall tests run on real time (see
+/// [`STREAM_OPEN_TIMEOUT`]).
+#[cfg(test)]
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// HTTP/2 keepalive ping interval on the channel, matching
 /// Google's own Firestore clients (`grpc.keepalive_time_ms:
@@ -1198,6 +1366,82 @@ pub(crate) async fn grpc_client(
 mod tests {
     use crate::value::Value;
     use firebase_native_core::{App, FirebaseOptions};
+
+    /// The generation gates rebuilds: a refresh against the
+    /// current generation rebuilds exactly once, and a stale
+    /// refresh (another component already rebuilt) adopts the
+    /// new channel instead of rebuilding again (issue #27).
+    /// The endpoint is never dialed — channels are lazy.
+    #[tokio::test]
+    async fn shared_channel_generations_gate_rebuilds() {
+        let shared = SharedChannel::new();
+        let endpoint = "http://127.0.0.1:9";
+        let (_, generation) = shared.get(endpoint).await.unwrap();
+        assert_eq!(generation, 0);
+        let (_, generation) = shared.get(endpoint).await.unwrap();
+        assert_eq!(generation, 0, "no rebuild without a refresh");
+        let (_, generation) = shared.refresh(endpoint, generation).await.unwrap();
+        assert_eq!(generation, 1, "refresh against current rebuilds");
+        let (_, generation) = shared.refresh(endpoint, 0).await.unwrap();
+        assert_eq!(generation, 1, "stale refresh adopts, does not rebuild");
+        let (_, generation) = shared.get(endpoint).await.unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    /// A unary call against a server that accepts TCP and
+    /// then never speaks must not wait forever: the call
+    /// deadline fires, the channel generation is rebuilt,
+    /// and the error is the transient `DeadlineExceeded` the
+    /// persistent reads' local-store fallback keys on
+    /// (issue #27). Runs on real time with the test-scaled
+    /// call deadline (about a second).
+    #[tokio::test]
+    async fn unary_call_against_a_stalling_server_times_out_transiently() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tcp.incoming() {
+                match stream {
+                    Ok(socket) => held.push(socket),
+                    Err(_) => break,
+                }
+            }
+        });
+        let app = App::new(FirebaseOptions::new("test-key", "demo-project"));
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint(format!("http://127.0.0.1:{port}"));
+        let error = firestore
+            .get_document("notes/a")
+            .await
+            .expect_err("a stalled unary call must fail, not hang");
+        assert!(
+            matches!(&error, Error::Rpc { code, .. } if code == "DeadlineExceeded"),
+            "expected a transient DeadlineExceeded, got {error:?}"
+        );
+        assert!(
+            crate::listen::is_transient_error(&error),
+            "the fallback keys on transient errors: {error:?}"
+        );
+        // The timeout must also have rebuilt the channel
+        // generation, or a unary-only client would time out
+        // on every call against the hung connection and
+        // never recover. This assertion is what makes a
+        // future tonic change to its "Timeout expired"
+        // message visible: without the recognition in
+        // `is_request_deadline_expired`, the error above
+        // would surface as Cancelled (still transient) but
+        // the generation would stay at 0.
+        let (_, generation) = firestore
+            .channel
+            .get(&firestore.endpoint)
+            .await
+            .expect("the channel is available");
+        assert_eq!(
+            generation, 1,
+            "the timed-out call must rebuild the generation"
+        );
+    }
 
     struct StubTokens;
 

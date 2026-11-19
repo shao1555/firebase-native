@@ -845,20 +845,35 @@ pub(crate) struct Backoff {
     current: Duration,
 }
 
+/// The reconnect backoff's first delay (doubling per
+/// failure, capped at `BACKOFF_MAX`).
+#[cfg(not(test))]
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Test scale (see `STREAM_OPEN_TIMEOUT` in client.rs):
+/// real-time stall tests cannot wait out production
+/// backoffs.
+#[cfg(test)]
+const BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+
+#[cfg(not(test))]
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const BACKOFF_MAX: Duration = Duration::from_millis(400);
+
 impl Backoff {
     pub(crate) fn new() -> Self {
         Self {
-            current: Duration::from_secs(1),
+            current: BACKOFF_INITIAL,
         }
     }
 
     pub(crate) fn reset(&mut self) {
-        self.current = Duration::from_secs(1);
+        self.current = BACKOFF_INITIAL;
     }
 
     pub(crate) fn next_delay(&mut self) -> Duration {
         let base = self.current;
-        self.current = (self.current * 2).min(Duration::from_secs(30));
+        self.current = (self.current * 2).min(BACKOFF_MAX);
         // Jitter from the wall clock's sub-second part; the exact
         // distribution does not matter, only decorrelation.
         let nanos = std::time::SystemTime::now()
@@ -1343,6 +1358,8 @@ fn flush_remote(engine: &PersistenceEngine, buffer: &mut BTreeMap<String, Option
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_watch(
     channel: Channel,
+    generation: u64,
+    shared_channel: Arc<crate::client::SharedChannel>,
     endpoint: String,
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
@@ -1355,6 +1372,8 @@ pub(crate) fn spawn_watch(
     let task = tokio::spawn(async move {
         run_watch(
             channel,
+            generation,
+            shared_channel,
             endpoint,
             options,
             tokens,
@@ -1419,15 +1438,11 @@ fn response_action(state: &mut WatchState, response: ListenResponse) -> Response
 /// How long the watch may stay in the Unknown online state
 /// (stream down, no successful reconnect yet) before it is
 /// considered Offline, mirroring the official SDKs.
+#[cfg(not(test))]
 const ONLINE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long one stream-open attempt may take before it is
-/// abandoned, whatever the online state. The Unknown
-/// deadline can be earlier and wins then; this bound is
-/// what keeps attempts moving once Offline (the Unknown
-/// deadline no longer exists there) or right after a
-/// healthy stream broke.
-const OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Test scale (see `STREAM_OPEN_TIMEOUT` in client.rs).
+#[cfg(test)]
+const ONLINE_STATE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Consecutive stream failures tolerated in the Unknown
 /// online state before the watch goes Offline: the official
@@ -1611,6 +1626,8 @@ impl WatchSync {
 #[allow(clippy::too_many_arguments)]
 async fn run_watch(
     mut channel: Channel,
+    mut generation: u64,
+    shared_channel: Arc<crate::client::SharedChannel>,
     endpoint: String,
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
@@ -1659,24 +1676,31 @@ async fn run_watch(
         }
     }
 
-    let mut first_attempt = true;
+    // Set when an open attempt is abandoned at its deadline:
+    // the connection behind it hung mid-handshake, which is
+    // the one failure shape the shared channel cannot recover
+    // from by itself (issue #27). Ordinary stream failures do
+    // not set it — tonic reconnects a merely dead connection
+    // internally, and churning the shared channel for them
+    // would disturb the Write stream and unary calls that
+    // share it.
+    let mut channel_suspect = false;
     'reconnect: loop {
         if sender.is_closed() {
             return;
         }
-        if !first_attempt {
-            // Every attempt after the first builds a fresh
-            // channel: a failed or abandoned attempt's
-            // transport is never reused. A connection that
-            // hung mid-handshake otherwise stays the shared
-            // channel's only connection, and each later
-            // attempt queues behind its corpse instead of
-            // dialing anew (issue #25). Reassigning drops the
-            // old channel — the previous attempt's client and
-            // stream are gone by now — and its connection
-            // with it.
-            match crate::client::build_channel(&endpoint).await {
-                Ok(fresh) => channel = fresh,
+        if channel_suspect {
+            channel_suspect = false;
+            // Rebuild the shared channel's current generation
+            // (or adopt a rebuild another component already
+            // made) so this attempt — and everyone else's next
+            // attempt — dials on a fresh channel instead of
+            // queueing behind the corpse.
+            match shared_channel.refresh(&endpoint, generation).await {
+                Ok((fresh, fresh_generation)) => {
+                    channel = fresh;
+                    generation = fresh_generation;
+                }
                 Err(_) => {
                     // The same endpoint built fine for the
                     // first attempt, so this cannot be a
@@ -1703,7 +1727,6 @@ async fn run_watch(
                 }
             }
         }
-        first_attempt = false;
         let mut client = match grpc_client(channel.clone(), &options, &tokens, force_refresh).await
         {
             Ok(client) => client,
@@ -1776,7 +1799,7 @@ async fn run_watch(
         // (issue #25).
         let open = client.listen(request);
         tokio::pin!(open);
-        let attempt_deadline = tokio::time::Instant::now() + OPEN_ATTEMPT_TIMEOUT;
+        let attempt_deadline = tokio::time::Instant::now() + crate::client::STREAM_OPEN_TIMEOUT;
         let deadline = sync
             .offline_deadline()
             .map_or(attempt_deadline, |unknown| unknown.min(attempt_deadline));
@@ -1789,12 +1812,14 @@ async fn run_watch(
             None => {
                 // The deadline expired mid-open: abandon the
                 // attempt (dropping the future drops the
-                // half-open stream); the reconnect loop
-                // retries on a fresh channel after backoff.
+                // half-open stream) and mark the channel
+                // suspect, so the reconnect loop rebuilds its
+                // generation before retrying after backoff.
                 // From Unknown this is the Offline transition
                 // and its flip is delivered; from Online or
                 // Offline it counts as one more failed
                 // attempt.
+                channel_suspect = true;
                 let went_offline = sync.on_timeout();
                 if !went_offline {
                     sync.on_stream_failure();
@@ -3554,7 +3579,7 @@ mod tests {
         let write = crate::write::WriteStream::new(
             options.clone(),
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         let engine = Arc::new(PersistenceEngine::new(store, write, PREFIX.to_string()));
@@ -3578,7 +3603,7 @@ mod tests {
         let write = crate::write::WriteStream::new(
             options.clone(),
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         let engine = Arc::new(
@@ -3944,20 +3969,20 @@ mod tests {
 
     /// End-to-end check of the issue #25 open race against a
     /// server that accepts TCP and then never speaks. Without
-    /// the race (and the fresh channel per attempt) the
+    /// the race (and the shared-channel generation rebuild
+    /// an abandoned attempt triggers) the
     /// driver would sit in the first `listen()` forever and
     /// the server would see exactly one connection; with
     /// them, each attempt is abandoned at its deadline and
     /// the reconnect loop dials again. The third connection
     /// is the telling one: it proves attempts keep being
     /// abandoned after the watch has gone Offline, where the
-    /// Unknown deadline no longer exists. Runs on tokio's
-    /// paused clock: the deadlines are virtual and
-    /// auto-advance while the runtime is idle, so the whole
-    /// sequence takes well under a second of real time (the
-    /// stalling server itself is a plain std thread and does
-    /// not care which clock the runtime uses).
-    #[tokio::test(start_paused = true)]
+    /// Unknown deadline no longer exists. Runs on real time
+    /// with the test-scaled timeouts and backoffs (a paused
+    /// clock raced the real connect; see
+    /// `STREAM_OPEN_TIMEOUT` in client.rs), so the whole
+    /// sequence takes about a second.
+    #[tokio::test]
     async fn stalling_server_open_is_abandoned_at_the_deadline() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4004,15 +4029,17 @@ mod tests {
         assert!(first.documents.is_empty());
 
         // Poll for the third connection, recording when each
-        // accept is first observed (virtual time), bounded at
-        // 300 x 200 ms = 60 s (the attempts land at roughly
-        // 0 s, 11 s and 23 s). The gaps pin *which* mechanism
-        // abandons each attempt: every redial must wait out a
-        // 10-second deadline — the Unknown one for the first
-        // attempt, the per-attempt one after Offline — plus
-        // that round's backoff (1 s, then 2 s, plus jitter).
+        // accept is first observed, bounded at 500 x 20 ms =
+        // 10 s (the attempts land at roughly 0 ms, 0.4 s and
+        // 1.1 s on the test-scaled constants). The gaps pin
+        // *which* mechanism abandons each attempt: the first
+        // redial waits out the Unknown deadline (300 ms in
+        // tests), the second — the watch already Offline,
+        // where that deadline no longer exists — the attempt
+        // deadline (600 ms), each plus that round's backoff
+        // (50 ms, then 100 ms, plus jitter).
         let mut observed: Vec<tokio::time::Instant> = Vec::new();
-        for _ in 0..300 {
+        for _ in 0..500 {
             let count = accepts.load(Ordering::SeqCst);
             while observed.len() < count {
                 observed.push(tokio::time::Instant::now());
@@ -4020,20 +4047,25 @@ mod tests {
             if count >= 3 {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
             observed.len() >= 3,
             "hung opens were not abandoned repeatedly: {} connection(s)",
             accepts.load(Ordering::SeqCst)
         );
-        for pair in observed.windows(2) {
-            let gap = pair[1] - pair[0];
-            assert!(
-                (Duration::from_secs(10)..=Duration::from_secs(15)).contains(&gap),
-                "redial gap {gap:?} is not a 10 s deadline plus backoff"
-            );
-        }
+        let gaps: Vec<Duration> = observed.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(gaps.len(), 2);
+        assert!(
+            (Duration::from_millis(250)..=Duration::from_secs(2)).contains(&gaps[0]),
+            "first redial gap {:?} is not the Unknown deadline plus backoff",
+            gaps[0]
+        );
+        assert!(
+            (Duration::from_millis(550)..=Duration::from_secs(3)).contains(&gaps[1]),
+            "second redial gap {:?} is not the attempt deadline plus backoff",
+            gaps[1]
+        );
         drop(watch);
         let _ = std::fs::remove_dir_all(&dir);
     }

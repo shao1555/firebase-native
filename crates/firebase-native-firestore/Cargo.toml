@@ -35,8 +35,3 @@ tower = { version = "0.5", features = ["util"] }
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
-
-[dev-dependencies]
-# `test-util` enables tokio's paused clock for tests
-# (`#[tokio::test(start_paused = true)]`).
-tokio = { workspace = true, features = ["test-util"] }
