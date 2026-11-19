@@ -33,7 +33,7 @@ use firebase_native_core::{Error, FirebaseOptions, Result, TokenProvider};
 use tonic::transport::Channel;
 use tonic::Request;
 
-use crate::client::{build_channel, grpc_client, map_status};
+use crate::client::{grpc_client, map_status};
 use crate::google::firestore::v1::firestore_client::FirestoreClient;
 use crate::google::firestore::v1::{Write, WriteRequest, WriteResponse};
 use crate::listen::Backoff;
@@ -290,7 +290,7 @@ pub(crate) struct WriteStream {
     /// The shared gRPC channel cell (the same one the owning
     /// `Firestore` uses), initialized on first connect so mere
     /// construction never performs I/O.
-    channel_cell: Arc<tokio::sync::OnceCell<Channel>>,
+    shared_channel: Arc<crate::client::SharedChannel>,
     endpoint: String,
     session: tokio::sync::Mutex<Option<Session>>,
     /// State salvaged from a dead session, so the next session
@@ -303,25 +303,21 @@ impl WriteStream {
     pub(crate) fn new(
         options: FirebaseOptions,
         tokens: Arc<dyn TokenProvider>,
-        channel_cell: Arc<tokio::sync::OnceCell<Channel>>,
+        shared_channel: Arc<crate::client::SharedChannel>,
         endpoint: String,
     ) -> Self {
         Self {
             options,
             tokens,
-            channel_cell,
+            shared_channel,
             endpoint,
             session: tokio::sync::Mutex::new(None),
             salvaged: std::sync::Mutex::new(None),
         }
     }
 
-    async fn channel(&self) -> Result<Channel> {
-        let channel = self
-            .channel_cell
-            .get_or_try_init(|| build_channel(&self.endpoint))
-            .await?;
-        Ok(channel.clone())
+    async fn channel(&self) -> Result<(Channel, u64)> {
+        self.shared_channel.get(&self.endpoint).await
     }
 
     /// Commits one batch, reconnecting and resending across
@@ -458,7 +454,7 @@ impl WriteStream {
     /// Opens a stream and completes the handshake (first response
     /// awaited before returning).
     async fn connect(&self, force_refresh: bool) -> Result<Session> {
-        let channel = self.channel().await?;
+        let (channel, generation) = self.channel().await?;
         let mut client: FirestoreClient<_> =
             grpc_client(channel, &self.options, &self.tokens, force_refresh).await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
@@ -494,13 +490,33 @@ impl WriteStream {
                 .metadata_mut()
                 .insert("google-cloud-resource-prefix", prefix);
         }
-        let mut responses = match client.write(request).await {
-            Ok(response) => response.into_inner(),
-            Err(status) => {
-                self.restore_salvage(protocol, replayed_ack);
-                return Err(map_status(status));
-            }
-        };
+        // The open is bounded like the Listen driver's: a
+        // handshake stalled mid-flight (a middlebox that
+        // accepted TCP and never speaks HTTP/2) otherwise
+        // pends forever — the connect timeout covers TCP/TLS
+        // only and keepalive starts once a connection exists.
+        // A timeout is the corpse-connection signature, so
+        // the shared channel's generation is rebuilt: this
+        // stream's retry, and every other user of the
+        // channel, dials on a fresh channel (issue #27).
+        let mut responses =
+            match tokio::time::timeout(crate::client::STREAM_OPEN_TIMEOUT, client.write(request))
+                .await
+            {
+                Ok(Ok(response)) => response.into_inner(),
+                Ok(Err(status)) => {
+                    self.restore_salvage(protocol, replayed_ack);
+                    return Err(map_status(status));
+                }
+                Err(_) => {
+                    self.restore_salvage(protocol, replayed_ack);
+                    let _ = self
+                        .shared_channel
+                        .refresh(&self.endpoint, generation)
+                        .await;
+                    return Err(Error::Other("write stream open timed out".to_string()));
+                }
+            };
         // Read until the handshake completes. On a resumed stream
         // the server first replays any commit responses past the
         // resume token (at most one batch can be outstanding in
@@ -509,8 +525,10 @@ impl WriteStream {
         // protocol and any replayed ack consumed so far: losing
         // the ack would resend a batch that already committed.
         loop {
-            match responses.message().await {
-                Ok(Some(response)) => match protocol.on_response(response) {
+            match tokio::time::timeout(crate::client::STREAM_OPEN_TIMEOUT, responses.message())
+                .await
+            {
+                Ok(Ok(Some(response))) => match protocol.on_response(response) {
                     Ok(WriteOutcome::Handshake) => {
                         return Ok(Session {
                             protocol,
@@ -539,15 +557,19 @@ impl WriteStream {
                         return Err(error);
                     }
                 },
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     self.restore_salvage(protocol, replayed_ack);
                     return Err(Error::Other(
                         "write stream closed during handshake".to_string(),
                     ));
                 }
-                Err(status) => {
+                Ok(Err(status)) => {
                     self.restore_salvage(protocol, replayed_ack);
                     return Err(map_status(status));
+                }
+                Err(_) => {
+                    self.restore_salvage(protocol, replayed_ack);
+                    return Err(Error::Other("write stream handshake timed out".to_string()));
                 }
             }
         }
@@ -558,6 +580,99 @@ impl WriteStream {
 mod tests {
     use super::*;
     use crate::google::firestore::v1::WriteResult;
+
+    /// End-to-end check of the issue #27 write-open bound
+    /// against a server that accepts TCP and then never
+    /// speaks: the first `connect()` open times out, the
+    /// shared channel's generation is rebuilt, and the retry
+    /// dials a second connection instead of queueing behind
+    /// the hung handshake. The gap between the connections
+    /// pins the mechanism: the open deadline plus the
+    /// retry's backoff. Runs on real time with the
+    /// test-scaled constants, like the Listen driver's stall
+    /// check.
+    #[tokio::test]
+    async fn stalling_server_write_open_is_abandoned_and_the_channel_rebuilt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tcp.incoming() {
+                match stream {
+                    Ok(socket) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        held.push(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        struct Tokens;
+        #[async_trait::async_trait]
+        impl firebase_native_core::TokenProvider for Tokens {
+            async fn id_token(&self, _force_refresh: bool) -> Result<String> {
+                Ok("dummy".to_string())
+            }
+        }
+
+        let options = firebase_native_core::FirebaseOptions {
+            api_key: "test-key".to_string(),
+            project_id: "p".to_string(),
+            auth_domain: None,
+            storage_bucket: None,
+            app_id: None,
+            database_id: "d".to_string(),
+        };
+        let stream = WriteStream::new(
+            options,
+            Arc::new(Tokens),
+            Arc::new(crate::client::SharedChannel::new()),
+            format!("http://127.0.0.1:{port}"),
+        );
+        let write = crate::google::firestore::v1::Write {
+            operation: Some(crate::google::firestore::v1::write::Operation::Update(
+                crate::google::firestore::v1::Document {
+                    name: "projects/p/databases/d/documents/notes/a".to_string(),
+                    fields: Default::default(),
+                    create_time: None,
+                    update_time: None,
+                },
+            )),
+            update_mask: None,
+            update_transforms: Vec::new(),
+            current_document: None,
+        };
+        // The batch can never commit against this server; the
+        // task retries forever and is dropped with the test.
+        let task = tokio::spawn(async move { stream.write_batch(vec![write]).await });
+        let mut observed: Vec<tokio::time::Instant> = Vec::new();
+        for _ in 0..250 {
+            let count = accepts.load(Ordering::SeqCst);
+            while observed.len() < count {
+                observed.push(tokio::time::Instant::now());
+            }
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed.len() >= 2,
+            "the hung write open was not abandoned: {} connection(s)",
+            accepts.load(Ordering::SeqCst)
+        );
+        let gap = observed[1] - observed[0];
+        assert!(
+            (Duration::from_millis(500)..=Duration::from_secs(3)).contains(&gap),
+            "redial gap {gap:?} is not the open deadline plus backoff"
+        );
+        task.abort();
+    }
 
     fn protocol_after_handshake() -> WriteProtocol {
         let mut protocol = WriteProtocol::new("projects/p/databases/d".to_string());

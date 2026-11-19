@@ -830,7 +830,7 @@ mod tests {
     fn test_engine() -> Arc<PersistenceEngine> {
         // The write stream inside this engine is never exercised by
         // these tests (no pump is started; batches are enqueued
-        // directly in the store). Its channel cell is never
+        // directly in the store). Its shared channel is never
         // initialized, so construction performs no I/O.
         let store = Arc::new(LocalStore::open_in_memory().unwrap());
         let options = firebase_native_core::FirebaseOptions {
@@ -844,7 +844,7 @@ mod tests {
         let write = WriteStream::new(
             options,
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         Arc::new(PersistenceEngine::new(
@@ -867,7 +867,7 @@ mod tests {
         let write = WriteStream::new(
             options,
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         Arc::new(
@@ -1128,7 +1128,7 @@ mod tests {
         let write = WriteStream::new(
             options,
             Arc::new(StubTokens),
-            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::client::SharedChannel::new()),
             "https://firestore.googleapis.com".to_string(),
         );
         let engine = Arc::new(

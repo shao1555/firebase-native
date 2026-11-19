@@ -133,14 +133,30 @@ Every `Snapshot` carries `metadata: SnapshotMetadata`:
   initial-sync signal. The detection is hardened against
   transports that hang instead of failing: a connect is
   bounded by a 10-second timeout, opening a stream is
-  bounded by a 10-second attempt deadline (and by the
-  Unknown state's deadline while reconnecting), and a
-  connection that dies silently — no FIN, no RST — is
-  caught by HTTP/2 keepalive (30-second interval,
-  matching Google's own clients). What is not detected:
-  a stream that opens on a live connection but never
-  delivers a message, which is indistinguishable from a
-  legitimately idle watch.
+  bounded by a 15-second attempt deadline (and by the
+  Unknown state's deadline while reconnecting), unary
+  calls carry a 30-second deadline, and a connection
+  that dies silently — no FIN, no RST — is caught by
+  HTTP/2 keepalive (30-second interval, matching
+  Google's own clients). What is not detected: a stream
+  that opens on a live connection but never delivers a
+  message, which is indistinguishable from a legitimately
+  idle watch. The channel is shared by the watch, the
+  Write stream and unary calls under a generation
+  counter: when an open is abandoned as hung, or a unary
+  call times out, that generation is rebuilt, so every
+  part of the client recovers on a fresh connection
+  instead of queueing behind the hung one — and the
+  timed-out unary call fails transiently, so a
+  store-backed read falls back to the local store
+  instead of waiting. The unary deadline is also sent
+  to the server as the request's gRPC deadline. Note
+  its edges: a write whose deadline expires may still
+  have been applied if the server committed it just
+  before the deadline (a retried create then reports
+  `AlreadyExists`), and `run_query` is bounded as a
+  whole, so a very large result on a slow link can
+  time out and fall back rather than arrive late.
 - `has_pending_writes` — some document in the view has
   mutations not yet acknowledged by the server.
 
