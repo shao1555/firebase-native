@@ -1340,8 +1340,10 @@ fn flush_remote(engine: &PersistenceEngine, buffer: &mut BTreeMap<String, Option
 /// `query` is the watch's query for query targets (used to
 /// decide limbo resolution outcomes); document watches pass
 /// `None` and never resolve limbo.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_watch(
     channel: Channel,
+    endpoint: String,
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
     target: Target,
@@ -1353,6 +1355,7 @@ pub(crate) fn spawn_watch(
     let task = tokio::spawn(async move {
         run_watch(
             channel,
+            endpoint,
             options,
             tokens,
             target,
@@ -1418,6 +1421,14 @@ fn response_action(state: &mut WatchState, response: ListenResponse) -> Response
 /// considered Offline, mirroring the official SDKs.
 const ONLINE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long one stream-open attempt may take before it is
+/// abandoned, whatever the online state. The Unknown
+/// deadline can be earlier and wins then; this bound is
+/// what keeps attempts moving once Offline (the Unknown
+/// deadline no longer exists there) or right after a
+/// healthy stream broke.
+const OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Consecutive stream failures tolerated in the Unknown
 /// online state before the watch goes Offline: the official
 /// SDKs' `MAX_WATCH_STREAM_FAILURES`.
@@ -1462,7 +1473,10 @@ struct WatchSync {
     /// Consecutive stream failures since the last successful
     /// stream.
     failures: u32,
-    /// When the state entered Unknown, for the timeout.
+    /// When the state entered Unknown, for the timeout. Set
+    /// from construction: the initial Unknown runs the same
+    /// timeout, so a first stream that never opens is bounded
+    /// too.
     unknown_since: Option<tokio::time::Instant>,
     /// CURRENT received on the current stream, awaiting the
     /// accepted consistent point that lands its remote event.
@@ -1477,7 +1491,7 @@ impl WatchSync {
         Self {
             state: OnlineState::Unknown,
             failures: 0,
-            unknown_since: None,
+            unknown_since: Some(tokio::time::Instant::now()),
             current_pending: false,
             current_promoted: false,
         }
@@ -1596,7 +1610,8 @@ impl WatchSync {
 // construction context, assembled once by the client.
 #[allow(clippy::too_many_arguments)]
 async fn run_watch(
-    channel: Channel,
+    mut channel: Channel,
+    endpoint: String,
     options: FirebaseOptions,
     tokens: Arc<dyn TokenProvider>,
     target: Target,
@@ -1644,10 +1659,51 @@ async fn run_watch(
         }
     }
 
+    let mut first_attempt = true;
     'reconnect: loop {
         if sender.is_closed() {
             return;
         }
+        if !first_attempt {
+            // Every attempt after the first builds a fresh
+            // channel: a failed or abandoned attempt's
+            // transport is never reused. A connection that
+            // hung mid-handshake otherwise stays the shared
+            // channel's only connection, and each later
+            // attempt queues behind its corpse instead of
+            // dialing anew (issue #25). Reassigning drops the
+            // old channel — the previous attempt's client and
+            // stream are gone by now — and its connection
+            // with it.
+            match crate::client::build_channel(&endpoint).await {
+                Ok(fresh) => channel = fresh,
+                Err(_) => {
+                    // The same endpoint built fine for the
+                    // first attempt, so this cannot be a
+                    // configuration error surfacing late;
+                    // count it as one more failed attempt.
+                    if sync.on_stream_failure()
+                        && !deliver_sync_flip(&store_watch, &mut delivery, &sender, sync.in_sync())
+                            .await
+                    {
+                        return;
+                    }
+                    if !sleep_with_delivery(
+                        backoff.next_delay(),
+                        &store_watch,
+                        &mut delivery,
+                        &sender,
+                        &mut sync,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue 'reconnect;
+                }
+            }
+        }
+        first_attempt = false;
         let mut client = match grpc_client(channel.clone(), &options, &tokens, force_refresh).await
         {
             Ok(client) => client,
@@ -1706,9 +1762,63 @@ async fn run_watch(
                 .metadata_mut()
                 .insert("google-cloud-resource-prefix", prefix);
         }
-        let mut stream = match client.listen(request).await {
-            Ok(response) => response.into_inner(),
-            Err(status) => {
+        // The open is raced against a deadline: the Unknown
+        // online state's deadline when there is one (so the
+        // Offline transition fires on time), and in every
+        // state an attempt deadline of its own. Once Offline
+        // the Unknown deadline no longer exists, but a
+        // stalling open — a middlebox that accepts TCP and
+        // never speaks HTTP/2 — must still be abandoned, or
+        // the watch would sit in that attempt forever even
+        // after the network recovers. Neither the connect
+        // timeout (TCP/TLS only) nor keepalive (it starts
+        // once an HTTP/2 connection exists) bounds this wait
+        // (issue #25).
+        let open = client.listen(request);
+        tokio::pin!(open);
+        let attempt_deadline = tokio::time::Instant::now() + OPEN_ATTEMPT_TIMEOUT;
+        let deadline = sync
+            .offline_deadline()
+            .map_or(attempt_deadline, |unknown| unknown.min(attempt_deadline));
+        let opened = tokio::select! {
+            result = open.as_mut() => Some(result),
+            _ = tokio::time::sleep_until(deadline) => None,
+        };
+        let mut stream = match opened {
+            Some(Ok(response)) => response.into_inner(),
+            None => {
+                // The deadline expired mid-open: abandon the
+                // attempt (dropping the future drops the
+                // half-open stream); the reconnect loop
+                // retries on a fresh channel after backoff.
+                // From Unknown this is the Offline transition
+                // and its flip is delivered; from Online or
+                // Offline it counts as one more failed
+                // attempt.
+                let went_offline = sync.on_timeout();
+                if !went_offline {
+                    sync.on_stream_failure();
+                }
+                if went_offline
+                    && !deliver_sync_flip(&store_watch, &mut delivery, &sender, sync.in_sync())
+                        .await
+                {
+                    return;
+                }
+                if !sleep_with_delivery(
+                    backoff.next_delay(),
+                    &store_watch,
+                    &mut delivery,
+                    &sender,
+                    &mut sync,
+                )
+                .await
+                {
+                    return;
+                }
+                continue 'reconnect;
+            }
+            Some(Err(status)) => {
                 if is_terminal(status.code()) && !is_database_mismatch(&status) {
                     let _ = sender.send(Err(map_status(status))).await;
                     return;
@@ -3740,6 +3850,10 @@ mod tests {
     fn watch_sync_promotes_current_only_at_an_accepted_consistent_point() {
         let mut sync = WatchSync::new();
         assert!(!sync.in_sync());
+        // The initial Unknown runs the timeout too, so a
+        // first stream that never opens is bounded (issue
+        // #25's race has a deadline to race against).
+        assert!(sync.offline_deadline().is_some());
         // The stream opens: Online, but the target is not
         // current yet.
         sync.on_stream_open();
@@ -3784,9 +3898,10 @@ mod tests {
         assert!(sync.in_sync());
         assert!(sync.offline_deadline().is_some());
         // The reconnect succeeds: Online again, still in
-        // sync, nothing to deliver.
+        // sync, nothing to deliver, no deadline ticking.
         sync.on_stream_open();
         assert!(sync.in_sync());
+        assert!(sync.offline_deadline().is_none());
     }
 
     #[test]
@@ -3825,6 +3940,102 @@ mod tests {
         assert!(sync.offline_deadline().is_none());
         sync.on_stream_open();
         assert!(!sync.in_sync());
+    }
+
+    /// End-to-end check of the issue #25 open race against a
+    /// server that accepts TCP and then never speaks. Without
+    /// the race (and the fresh channel per attempt) the
+    /// driver would sit in the first `listen()` forever and
+    /// the server would see exactly one connection; with
+    /// them, each attempt is abandoned at its deadline and
+    /// the reconnect loop dials again. The third connection
+    /// is the telling one: it proves attempts keep being
+    /// abandoned after the watch has gone Offline, where the
+    /// Unknown deadline no longer exists. Runs on tokio's
+    /// paused clock: the deadlines are virtual and
+    /// auto-advance while the runtime is idle, so the whole
+    /// sequence takes well under a second of real time (the
+    /// stalling server itself is a plain std thread and does
+    /// not care which clock the runtime uses).
+    #[tokio::test(start_paused = true)]
+    async fn stalling_server_open_is_abandoned_at_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tcp.incoming() {
+                match stream {
+                    Ok(socket) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        held.push(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        struct Tokens;
+        #[async_trait::async_trait]
+        impl firebase_native_core::TokenProvider for Tokens {
+            async fn id_token(&self, _force_refresh: bool) -> Result<String> {
+                Ok("dummy".to_string())
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("firebase-native-stall-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+        let app = firebase_native_core::App::new(FirebaseOptions::new("test-key", "demo-project"));
+        let firestore = crate::Firestore::new(&app, Arc::new(Tokens))
+            .with_endpoint(format!("http://127.0.0.1:{port}"))
+            .enable_local_store(&store_path)
+            .unwrap();
+        let mut watch = firestore.watch_document("notes/a").await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), watch.next())
+            .await
+            .expect("cache snapshot timed out")
+            .expect("watch ended")
+            .expect("cache snapshot failed");
+        assert!(first.documents.is_empty());
+
+        // Poll for the third connection, recording when each
+        // accept is first observed (virtual time), bounded at
+        // 300 x 200 ms = 60 s (the attempts land at roughly
+        // 0 s, 11 s and 23 s). The gaps pin *which* mechanism
+        // abandons each attempt: every redial must wait out a
+        // 10-second deadline — the Unknown one for the first
+        // attempt, the per-attempt one after Offline — plus
+        // that round's backoff (1 s, then 2 s, plus jitter).
+        let mut observed: Vec<tokio::time::Instant> = Vec::new();
+        for _ in 0..300 {
+            let count = accepts.load(Ordering::SeqCst);
+            while observed.len() < count {
+                observed.push(tokio::time::Instant::now());
+            }
+            if count >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            observed.len() >= 3,
+            "hung opens were not abandoned repeatedly: {} connection(s)",
+            accepts.load(Ordering::SeqCst)
+        );
+        for pair in observed.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                (Duration::from_secs(10)..=Duration::from_secs(15)).contains(&gap),
+                "redial gap {gap:?} is not a 10 s deadline plus backoff"
+            );
+        }
+        drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct OfflineTokens;
