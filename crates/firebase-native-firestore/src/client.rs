@@ -338,6 +338,7 @@ impl Firestore {
         let channel = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
+            self.endpoint.clone(),
             self.options.clone(),
             self.tokens.clone(),
             target,
@@ -376,6 +377,7 @@ impl Firestore {
         let channel = self.channel().await?;
         Ok(crate::listen::spawn_watch(
             channel,
+            self.endpoint.clone(),
             self.options.clone(),
             self.tokens.clone(),
             target,
@@ -1067,9 +1069,23 @@ pub(crate) fn map_status(status: Status) -> Error {
     }
 }
 
-/// Builds an authenticated gRPC client over an existing channel.
-/// Shared by the unary calls and the Listen stream driver: every
-/// (re)connection fetches the token for that attempt.
+/// How long establishing one connection may take before the
+/// attempt is abandoned. Bounds a connect on a network that
+/// silently drops packets, which otherwise hangs until the OS
+/// gives up (issue #25).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// HTTP/2 keepalive ping interval on the channel, matching
+/// Google's own Firestore clients (`grpc.keepalive_time_ms:
+/// 30000`): a connection that dies silently — no FIN, no RST —
+/// is detected when a ping goes unacknowledged, and the watch
+/// driver's failure handling can run (issue #25).
+const KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a keepalive ping may go unacknowledged before the
+/// connection is closed as dead (the gRPC default).
+const KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Builds the shared gRPC channel for an endpoint: native-root TLS
 /// for `https://`, with a CONNECT tunnel when the environment
 /// routes through a proxy (tonic cannot tunnel by itself).
@@ -1080,7 +1096,16 @@ pub(crate) async fn build_channel(endpoint_str: &str) -> Result<Channel> {
     // (a no-op when a default was already installed).
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut endpoint = Endpoint::from_shared(endpoint_str.to_string())
-        .map_err(|err| Error::Other(format!("invalid endpoint: {err}")))?;
+        .map_err(|err| Error::Other(format!("invalid endpoint: {err}")))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        // Pings run while calls are in flight — a watch
+        // stream is one, which is exactly the window that
+        // needs detection. An idle channel stays quiet, as
+        // in Google's clients (no keepalive permit without
+        // calls).
+        .keep_alive_while_idle(false);
     if endpoint_str.starts_with("https://") {
         if let Some(proxy) = endpoint
             .uri()
@@ -1143,6 +1168,9 @@ fn generate_document_id() -> String {
     id
 }
 
+/// Builds an authenticated gRPC client over an existing channel.
+/// Shared by the unary calls and the Listen stream driver: every
+/// (re)connection fetches the token for that attempt.
 pub(crate) async fn grpc_client(
     channel: Channel,
     options: &FirebaseOptions,

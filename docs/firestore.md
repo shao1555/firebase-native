@@ -130,10 +130,17 @@ Every `Snapshot` carries `metadata: SnapshotMetadata`:
   snapshot. Local writes and their acknowledgements
   never set it while the watch is in sync. The first
   snapshot with `is_from_cache == false` is the watch's
-  initial-sync signal. (One limit: Offline detection
-  relies on failures being reported promptly — a
-  transport that hangs silently is tracked in issue
-  #25.)
+  initial-sync signal. The detection is hardened against
+  transports that hang instead of failing: a connect is
+  bounded by a 10-second timeout, opening a stream is
+  bounded by a 10-second attempt deadline (and by the
+  Unknown state's deadline while reconnecting), and a
+  connection that dies silently — no FIN, no RST — is
+  caught by HTTP/2 keepalive (30-second interval,
+  matching Google's own clients). What is not detected:
+  a stream that opens on a live connection but never
+  delivers a message, which is indistinguishable from a
+  legitimately idle watch.
 - `has_pending_writes` — some document in the view has
   mutations not yet acknowledged by the server.
 
