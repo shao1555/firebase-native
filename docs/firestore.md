@@ -118,11 +118,22 @@ official SDKs.
 
 Every `Snapshot` carries `metadata: SnapshotMetadata`:
 
-- `is_from_cache` — the snapshot was composed from the
-  local store (or, online, precedes the watch's first
-  server-confirmed state). The first snapshot with
-  `is_from_cache == false` is the watch's initial-sync
-  signal.
+- `is_from_cache` — the snapshot's view is not known to
+  be in sync with the server: the target has not reached
+  CURRENT, or the client is Offline in the official
+  SDKs' `OnlineState` sense. A stream failure alone does
+  not set it (the state moves Online → Unknown and views
+  stay current, so a routine reconnect never flickers
+  the flag); a failed reconnect attempt, or about ten
+  seconds without a successful stream, moves it to
+  Offline, sets the flag, and raises a metadata-only
+  snapshot. Local writes and their acknowledgements
+  never set it while the watch is in sync. The first
+  snapshot with `is_from_cache == false` is the watch's
+  initial-sync signal. (One limit: Offline detection
+  relies on failures being reported promptly — a
+  transport that hangs silently is tracked in issue
+  #25.)
 - `has_pending_writes` — some document in the view has
   mutations not yet acknowledged by the server.
 

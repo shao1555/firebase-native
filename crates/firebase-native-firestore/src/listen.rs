@@ -93,12 +93,17 @@ pub struct Snapshot {
 /// `SnapshotMetadata`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotMetadata {
-    /// This snapshot reflects the local store's composed view —
-    /// the initial cache snapshot and latency-compensated local
-    /// updates — rather than a server round-trip. Only a watch
-    /// backed by a local store produces these; the first
-    /// snapshot with this `false` marks the watch's initial
-    /// sync (one full server round-trip for the target).
+    /// The snapshot's view is not known to be in sync with
+    /// the server: the target has not reached CURRENT, or the
+    /// client is Offline in the official SDKs' `OnlineState`
+    /// sense — a stream failure alone does not set this (the
+    /// state moves Online → Unknown and views stay current);
+    /// a failed reconnect attempt, or about ten seconds
+    /// without a successful stream, does, and raises a
+    /// metadata-only snapshot. Local events — a write or its
+    /// acknowledgement — never set this while the watch is in
+    /// sync. The first snapshot with this `false` marks the
+    /// watch's initial sync.
     pub is_from_cache: bool,
     /// The local store holds mutations affecting this watch
     /// that the server has not acknowledged yet: a mutation on
@@ -302,6 +307,7 @@ impl WatchState {
 
     /// Whether the target has been marked CURRENT since its
     /// (re)add.
+    #[cfg(test)]
     pub(crate) fn is_current(&self) -> bool {
         self.current_received
     }
@@ -1067,14 +1073,21 @@ impl StoreDelivery {
     /// what was delivered (the first call always emits: the
     /// cache snapshot). Returns false when the listener is gone
     /// or the store failed (the error is delivered first).
-    /// `from_cache` records the event's origin: `true` for the
-    /// initial cache snapshot and local (latency-compensated)
-    /// updates, `false` when a server snapshot was just applied.
+    /// `in_sync` is the watch's synchronization state (see
+    /// `WatchSync`: the target is current as of an accepted
+    /// consistent point, and the client is not Offline), and
+    /// `is_from_cache` is its negation for *every* event,
+    /// whatever raised it: a local write or its
+    /// acknowledgement while in sync reports
+    /// `is_from_cache == false`. This matches the official
+    /// SDKs, where fromCache means "this view is not known to
+    /// be in sync with the server", not "this event originated
+    /// locally" (issue #23).
     async fn emit(
         &mut self,
         watch: &StoreWatch,
         sender: &tokio::sync::mpsc::Sender<Result<Snapshot>>,
-        from_cache: bool,
+        in_sync: bool,
     ) -> bool {
         let view = match watch.composed() {
             Ok(view) => view,
@@ -1086,7 +1099,7 @@ impl StoreDelivery {
         self.seen_generation = watch.engine.generation();
         let changes = diff_snapshots(&self.delivered, &view);
         let metadata = SnapshotMetadata {
-            is_from_cache: from_cache,
+            is_from_cache: !in_sync,
             has_pending_writes: watch.has_pending_writes(&view),
         };
         if changes.is_empty() && self.delivered_once && self.last_metadata == Some(metadata) {
@@ -1235,12 +1248,16 @@ fn reconcile_view_removals(
 /// delivered as they happen. Offline latency compensation must
 /// not pause for reconnect backoff — a queued write is visible
 /// to the listener while the client is still failing to open a
-/// stream. Returns false when the listener is gone.
+/// stream. The Unknown online state's timeout is folded into
+/// the wait: when it expires mid-sleep the watch goes Offline
+/// and the metadata flip is delivered. Returns false when the
+/// listener is gone.
 async fn sleep_with_delivery(
     delay: Duration,
     store_watch: &Option<StoreWatch>,
     delivery: &mut StoreDelivery,
     sender: &tokio::sync::mpsc::Sender<Result<Snapshot>>,
+    sync: &mut WatchSync,
 ) -> bool {
     let Some(watch) = store_watch else {
         tokio::time::sleep(delay).await;
@@ -1249,26 +1266,56 @@ async fn sleep_with_delivery(
     let deadline = tokio::time::Instant::now() + delay;
     loop {
         if watch.engine.generation() != delivery.seen_generation {
-            if !delivery.emit(watch, sender, true).await {
+            if !delivery.emit(watch, sender, sync.in_sync()).await {
                 return false;
             }
             continue;
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             return true;
         }
+        // The Unknown -> Offline timeout may expire before
+        // the backoff does; wake for whichever comes first.
+        let offline_in = sync
+            .offline_deadline()
+            .map(|at| at.saturating_duration_since(now));
+        if offline_in == Some(Duration::ZERO) {
+            if sync.on_timeout() && !delivery.emit(watch, sender, sync.in_sync()).await {
+                return false;
+            }
+            continue;
+        }
+        let wait = offline_in.map_or(remaining, |offline| remaining.min(offline));
         let notified = watch.engine.view_notified();
         tokio::pin!(notified);
         let _ = notified.as_mut().enable();
         tokio::select! {
-            _ = tokio::time::sleep(remaining) => return true,
+            _ = tokio::time::sleep(wait) => {}
             _ = notified => {
-                if !delivery.emit(watch, sender, true).await {
+                if !delivery.emit(watch, sender, sync.in_sync()).await {
                     return false;
                 }
             }
         }
+    }
+}
+
+/// Delivers the metadata flip after a sync-state transition
+/// (going Offline, or recovering from it). `StoreDelivery`
+/// suppresses the send when nothing observable changed, so
+/// calling this on every such transition is safe. Returns
+/// false when the listener is gone.
+async fn deliver_sync_flip(
+    store_watch: &Option<StoreWatch>,
+    delivery: &mut StoreDelivery,
+    sender: &tokio::sync::mpsc::Sender<Result<Snapshot>>,
+    in_sync: bool,
+) -> bool {
+    match store_watch {
+        Some(watch) => delivery.emit(watch, sender, in_sync).await,
+        None => true,
     }
 }
 
@@ -1366,6 +1413,185 @@ fn response_action(state: &mut WatchState, response: ListenResponse) -> Response
     }
 }
 
+/// How long the watch may stay in the Unknown online state
+/// (stream down, no successful reconnect yet) before it is
+/// considered Offline, mirroring the official SDKs.
+const ONLINE_STATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Consecutive stream failures tolerated in the Unknown
+/// online state before the watch goes Offline: the official
+/// SDKs' `MAX_WATCH_STREAM_FAILURES`.
+const MAX_STREAM_FAILURES: u32 = 1;
+
+/// The connection's online state, mirroring the official
+/// SDKs' `OnlineState`: a failed stream moves Online to
+/// Unknown and views stay current; the state goes Offline —
+/// and only then do snapshots turn from-cache — after a
+/// failed reconnect attempt or `ONLINE_STATE_TIMEOUT`
+/// without a successful stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnlineState {
+    Unknown,
+    Online,
+    Offline,
+}
+
+/// The store-backed watch's synchronization bookkeeping: it
+/// decides whether snapshots are in sync with the server,
+/// which `SnapshotMetadata::is_from_cache` negates.
+///
+/// Two inputs combine:
+///
+/// - The target's currency. A CURRENT counts only once the
+///   consistent point that carries its remote event has been
+///   *accepted*: the event's document changes sit in the
+///   driver's buffer until that barrier, so a view composed
+///   before it has not landed the server state and must not
+///   be reported in sync. Currency survives the Unknown
+///   state (brief failures keep views current); going
+///   Offline voids it — the official SDKs drop the view's
+///   currency there too — as do a RESET and a target
+///   restart, immediately.
+/// - The `OnlineState` tracker above. `in_sync` holds while
+///   the state is not Offline, so a routine reconnect — a
+///   token refresh, a server-side stream close — never
+///   flickers the flag.
+#[derive(Debug)]
+struct WatchSync {
+    state: OnlineState,
+    /// Consecutive stream failures since the last successful
+    /// stream.
+    failures: u32,
+    /// When the state entered Unknown, for the timeout.
+    unknown_since: Option<tokio::time::Instant>,
+    /// CURRENT received on the current stream, awaiting the
+    /// accepted consistent point that lands its remote event.
+    current_pending: bool,
+    /// The target is current as of an accepted consistent
+    /// point.
+    current_promoted: bool,
+}
+
+impl WatchSync {
+    fn new() -> Self {
+        Self {
+            state: OnlineState::Unknown,
+            failures: 0,
+            unknown_since: None,
+            current_pending: false,
+            current_promoted: false,
+        }
+    }
+
+    /// Whether snapshots composed now are in sync with the
+    /// server.
+    fn in_sync(&self) -> bool {
+        self.current_promoted && self.state != OnlineState::Offline
+    }
+
+    /// A stream opened successfully: back to Online, the
+    /// failure count resets, and a pending CURRENT from a
+    /// previous stream is dropped. (Recovering from Offline
+    /// delivers nothing here: going Offline voided the
+    /// target's currency, so `in_sync` stays false until the
+    /// next CURRENT is promoted.)
+    fn on_stream_open(&mut self) {
+        self.state = OnlineState::Online;
+        self.failures = 0;
+        self.unknown_since = None;
+        self.current_pending = false;
+    }
+
+    /// A stream failed: it could not be opened, or it ended.
+    /// Returns true when this failure took the watch Offline
+    /// (the caller delivers the metadata flip).
+    fn on_stream_failure(&mut self) -> bool {
+        self.current_pending = false;
+        match self.state {
+            OnlineState::Online => {
+                self.state = OnlineState::Unknown;
+                self.unknown_since = Some(tokio::time::Instant::now());
+                false
+            }
+            OnlineState::Unknown | OnlineState::Offline => {
+                self.failures += 1;
+                if self.state == OnlineState::Unknown && self.failures >= MAX_STREAM_FAILURES {
+                    self.state = OnlineState::Offline;
+                    self.unknown_since = None;
+                    self.current_pending = false;
+                    self.current_promoted = false;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// The instant the Unknown timeout expires, if counting.
+    fn offline_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.state == OnlineState::Unknown {
+            self.unknown_since.map(|since| since + ONLINE_STATE_TIMEOUT)
+        } else {
+            None
+        }
+    }
+
+    /// The Unknown timeout expired without a successful
+    /// stream. Returns true when the watch went Offline.
+    fn on_timeout(&mut self) -> bool {
+        if self.state == OnlineState::Unknown {
+            self.state = OnlineState::Offline;
+            self.unknown_since = None;
+            self.current_pending = false;
+            self.current_promoted = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inspects one response about to be fed to the state
+    /// machine: a CURRENT addressed to this watch's target
+    /// (stream-wide, or targeted at it — never a limbo
+    /// target's) becomes pending; a RESET voids the target's
+    /// currency at once.
+    fn note_target_change(&mut self, response: &ListenResponse, target_id: i32) {
+        let Some(ResponseType::TargetChange(change)) = &response.response_type else {
+            return;
+        };
+        if !(change.target_ids.is_empty() || change.target_ids.contains(&target_id)) {
+            return;
+        }
+        match change.target_change_type() {
+            TargetChangeType::Current => self.current_pending = true,
+            TargetChangeType::Reset => {
+                self.current_pending = false;
+                self.current_promoted = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Promotes a pending CURRENT once the response that
+    /// carried it (or a later one) was accepted at a
+    /// consistent point: only then has its remote event
+    /// landed in the store.
+    fn note_consistent_point(&mut self, accepted: bool) {
+        if accepted && self.current_pending {
+            self.current_promoted = true;
+            self.current_pending = false;
+        }
+    }
+
+    /// The target restarted (an existence-filter mismatch):
+    /// its currency is void until re-established.
+    fn note_target_restart(&mut self) {
+        self.current_pending = false;
+        self.current_promoted = false;
+    }
+}
+
 // The parameter list mirrors `spawn_watch`'s: the watch's full
 // construction context, assembled once by the client.
 #[allow(clippy::too_many_arguments)]
@@ -1398,6 +1624,14 @@ async fn run_watch(
     // baseline an existence-filter restart's casualties are
     // computed against.
     let mut delivery = StoreDelivery::new();
+    // The store-backed delivery's synchronization state, from
+    // which `is_from_cache` is derived (see `WatchSync`). The
+    // state machine's own `current_received` cannot serve
+    // here: it is sticky across streams and becomes true the
+    // moment CURRENT arrives, before the barrier that lands
+    // the remote event — it drives snapshot synthesis, not
+    // this metadata.
+    let mut sync = WatchSync::new();
     let mut last_state_docs: Vec<Document> = Vec::new();
     if let Some(watch) = &store_watch {
         // A watch-only workload may never enqueue a write, so
@@ -1405,7 +1639,7 @@ async fn run_watch(
         // collection) is running for this engine.
         watch.engine.ensure_pump();
         last_state_docs = watch.seed(&mut state);
-        if !delivery.emit(watch, &sender, true).await {
+        if !delivery.emit(watch, &sender, sync.in_sync()).await {
             return;
         }
     }
@@ -1422,8 +1656,20 @@ async fn run_watch(
                 // the network is down while a refresh is due). The
                 // watch must survive outages: back off and retry
                 // instead of ending permanently.
-                if !sleep_with_delivery(backoff.next_delay(), &store_watch, &mut delivery, &sender)
-                    .await
+                if sync.on_stream_failure()
+                    && !deliver_sync_flip(&store_watch, &mut delivery, &sender, sync.in_sync())
+                        .await
+                {
+                    return;
+                }
+                if !sleep_with_delivery(
+                    backoff.next_delay(),
+                    &store_watch,
+                    &mut delivery,
+                    &sender,
+                    &mut sync,
+                )
+                .await
                 {
                     return;
                 }
@@ -1470,14 +1716,28 @@ async fn run_watch(
                 if status.code() == Code::Unauthenticated {
                     force_refresh = true;
                 }
-                if !sleep_with_delivery(backoff.next_delay(), &store_watch, &mut delivery, &sender)
-                    .await
+                if sync.on_stream_failure()
+                    && !deliver_sync_flip(&store_watch, &mut delivery, &sender, sync.in_sync())
+                        .await
+                {
+                    return;
+                }
+                if !sleep_with_delivery(
+                    backoff.next_delay(),
+                    &store_watch,
+                    &mut delivery,
+                    &sender,
+                    &mut sync,
+                )
+                .await
                 {
                     return;
                 }
                 continue 'reconnect;
             }
         };
+
+        sync.on_stream_open();
 
         // (Re)start any limbo resolutions the previous stream
         // left queued.
@@ -1510,7 +1770,7 @@ async fn run_watch(
             };
             if let Some(watch) = &store_watch {
                 if watch.engine.generation() != delivery.seen_generation {
-                    if !delivery.emit(watch, &sender, true).await {
+                    if !delivery.emit(watch, &sender, sync.in_sync()).await {
                         return;
                     }
                     continue 'stream;
@@ -1523,7 +1783,7 @@ async fn run_watch(
                     // acknowledgement fold, a cached fetch):
                     // recompose and deliver if the view moved.
                     if let Some(watch) = &store_watch {
-                        if !delivery.emit(watch, &sender, true).await {
+                        if !delivery.emit(watch, &sender, sync.in_sync()).await {
                             return;
                         }
                     }
@@ -1616,13 +1876,17 @@ async fn run_watch(
                         if store_watch.is_some() {
                             buffer_remote(&response, target.target_id, &mut buffer, &mut view_only);
                         }
+                        sync.note_target_change(&response, target.target_id);
                         let action = response_action(&mut state, response);
                         // Whether the state machine accepted a
                         // consistent point in this response (not
                         // stale, addressed to this target): only
                         // then does the buffered remote event
-                        // complete and land in the store.
+                        // complete and land in the store. A
+                        // pending CURRENT is promoted on the
+                        // same signal: its event has landed.
                         let accepted = state.take_consistent_point();
+                        sync.note_consistent_point(accepted);
                         match action {
                             ResponseAction::Deliver(snapshot) => {
                                 backoff.reset();
@@ -1652,7 +1916,7 @@ async fn run_watch(
                                     }
                                     last_state_docs = snapshot.documents.clone();
                                     delivery.last_read_time = snapshot.read_time;
-                                    if !delivery.emit(watch, &sender, !state.is_current()).await {
+                                    if !delivery.emit(watch, &sender, sync.in_sync()).await {
                                         return;
                                     }
                                 } else if sender.send(Ok(snapshot)).await.is_err() {
@@ -1704,7 +1968,8 @@ async fn run_watch(
                                         watch.sync_membership(&last_state_docs, true);
                                         watch.engine.wake_pump();
                                     }
-                                    if !delivery.emit(watch, &sender, !state.is_current()).await {
+                                    sync.note_target_restart();
+                                    if !delivery.emit(watch, &sender, sync.in_sync()).await {
                                         return;
                                     }
                                 } else if let Some(snapshot) = snapshot {
@@ -1768,11 +2033,27 @@ async fn run_watch(
         if sender.is_closed() {
             return;
         }
-        if !restart
-            && !sleep_with_delivery(backoff.next_delay(), &store_watch, &mut delivery, &sender)
-                .await
-        {
-            return;
+        if !restart {
+            // A stream that ended is a watch-stream failure
+            // for the online state (an existence-filter
+            // restart is not: it re-adds at once on a healthy
+            // new stream).
+            if sync.on_stream_failure()
+                && !deliver_sync_flip(&store_watch, &mut delivery, &sender, sync.in_sync()).await
+            {
+                return;
+            }
+            if !sleep_with_delivery(
+                backoff.next_delay(),
+                &store_watch,
+                &mut delivery,
+                &sender,
+                &mut sync,
+            )
+            .await
+            {
+                return;
+            }
         }
     }
 }
@@ -3260,8 +3541,9 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
         let mut delivery = StoreDelivery::new();
 
-        // The first emit is the cache snapshot.
-        assert!(delivery.emit(&store_watch, &sender, true).await);
+        // The first emit is the cache snapshot (no stream:
+        // out of sync).
+        assert!(delivery.emit(&store_watch, &sender, false).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert_eq!(snapshot.documents.len(), 1);
         assert_eq!(snapshot.changes.len(), 1);
@@ -3271,7 +3553,7 @@ mod tests {
         assert!(!snapshot.metadata.has_pending_writes);
 
         // Nothing changed: no further snapshot.
-        assert!(delivery.emit(&store_watch, &sender, true).await);
+        assert!(delivery.emit(&store_watch, &sender, false).await);
         assert!(receiver.try_recv().is_err());
 
         // A queued local write appears in the composed view as
@@ -3291,7 +3573,7 @@ mod tests {
                 transforms: Vec::new(),
             }])
             .unwrap();
-        assert!(delivery.emit(&store_watch, &sender, true).await);
+        assert!(delivery.emit(&store_watch, &sender, false).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert_eq!(snapshot.documents.len(), 2);
         assert_eq!(snapshot.changes.len(), 1);
@@ -3300,8 +3582,9 @@ mod tests {
             snapshot.changes[0].document.name,
             format!("{PREFIX}/notes/b")
         );
-        // The latency-compensated snapshot is cache state and
-        // reports the queued write as pending.
+        // The latency-compensated snapshot while out of sync
+        // is cache state and reports the queued write as
+        // pending.
         assert!(snapshot.metadata.is_from_cache);
         assert!(snapshot.metadata.has_pending_writes);
     }
@@ -3325,22 +3608,22 @@ mod tests {
             }])
             .unwrap();
         // The cache snapshot reports the pending delete too.
-        assert!(delivery.emit(&store_watch, &sender, true).await);
+        assert!(delivery.emit(&store_watch, &sender, false).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert!(snapshot.metadata.is_from_cache);
         assert!(snapshot.metadata.has_pending_writes);
 
-        // A server snapshot over the unchanged view is still
+        // Reaching sync over the unchanged view is still
         // delivered: the metadata flip is itself the event
         // (it marks the initial sync).
-        assert!(delivery.emit(&store_watch, &sender, false).await);
+        assert!(delivery.emit(&store_watch, &sender, true).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         assert_eq!(snapshot.documents.len(), 1);
         assert!(!snapshot.metadata.is_from_cache);
         assert!(snapshot.metadata.has_pending_writes);
 
         // Nothing changed since: no further snapshot.
-        assert!(delivery.emit(&store_watch, &sender, false).await);
+        assert!(delivery.emit(&store_watch, &sender, true).await);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -3365,13 +3648,183 @@ mod tests {
             .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
         let mut delivery = StoreDelivery::new();
-        assert!(delivery.emit(&watch, &sender, true).await);
+        assert!(delivery.emit(&watch, &sender, false).await);
         let snapshot = receiver.recv().await.unwrap().unwrap();
         // The composed view is empty (the delete is already
         // applied locally), but the watch still reports the
         // unacknowledged write.
         assert!(snapshot.documents.is_empty());
         assert!(snapshot.metadata.has_pending_writes);
+    }
+
+    /// Issue #23: `is_from_cache` follows the watch's
+    /// synchronization state, not the origin of the event that
+    /// raised the snapshot. Online and CURRENT, a local write
+    /// and its acknowledgement keep reporting
+    /// `is_from_cache == false`; only losing the stream (or
+    /// not having reached CURRENT yet) makes snapshots cache
+    /// state again.
+    #[tokio::test]
+    async fn store_delivery_from_cache_tracks_sync_state_not_event_origin() {
+        let (engine, store_watch) = test_store_watch();
+        engine
+            .store_remote_document(&stored_doc("notes/a", 1))
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let mut delivery = StoreDelivery::new();
+        let set = |path: &str, n: i64| crate::mutation::Mutation::Set {
+            path: path.to_string(),
+            fields: {
+                let mut fields = Fields::new();
+                fields.insert("n".to_string(), Value::Integer(n));
+                fields
+            },
+            merge_paths: None,
+            exists: None,
+            transforms: Vec::new(),
+        };
+
+        // Before CURRENT: the cache snapshot is from cache.
+        assert!(delivery.emit(&store_watch, &sender, false).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert!(snapshot.metadata.is_from_cache);
+        assert!(!snapshot.metadata.has_pending_writes);
+
+        // CURRENT arrives: the metadata flip alone delivers a
+        // snapshot (the initial-sync signal).
+        assert!(delivery.emit(&store_watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert!(!snapshot.metadata.is_from_cache);
+        assert!(!snapshot.metadata.has_pending_writes);
+
+        // A local write while online and CURRENT is latency
+        // compensation, but not cache state.
+        engine.store().enqueue_batch(&[set("notes/b", 2)]).unwrap();
+        assert!(delivery.emit(&store_watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(snapshot.documents.len(), 2);
+        assert!(!snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+
+        // The acknowledgement clears the pending flag, and the
+        // snapshot stays not-from-cache. (This is where the
+        // origin-based classification flipped back to true.)
+        let batch = engine.store().peek_batches(1).unwrap().remove(0);
+        engine
+            .fold_acknowledgement(&batch, Timestamp::new(20, 0))
+            .unwrap();
+        assert!(delivery.emit(&store_watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(snapshot.documents.len(), 2);
+        assert!(!snapshot.metadata.is_from_cache);
+        assert!(!snapshot.metadata.has_pending_writes);
+
+        // The stream breaks: a local write is cache state
+        // again.
+        engine.store().enqueue_batch(&[set("notes/c", 3)]).unwrap();
+        assert!(delivery.emit(&store_watch, &sender, false).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(snapshot.documents.len(), 3);
+        assert!(snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+
+        // Reconnect and CURRENT: back to not-from-cache, with
+        // the write still pending.
+        assert!(delivery.emit(&store_watch, &sender, true).await);
+        let snapshot = receiver.recv().await.unwrap().unwrap();
+        assert!(!snapshot.metadata.is_from_cache);
+        assert!(snapshot.metadata.has_pending_writes);
+    }
+
+    #[test]
+    fn watch_sync_promotes_current_only_at_an_accepted_consistent_point() {
+        let mut sync = WatchSync::new();
+        assert!(!sync.in_sync());
+        // The stream opens: Online, but the target is not
+        // current yet.
+        sync.on_stream_open();
+        assert!(!sync.in_sync());
+        // A CURRENT addressed to a limbo target does not
+        // count.
+        sync.note_target_change(&targeted_current(999, 1), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(!sync.in_sync());
+        // CURRENT for this target is pending only: before the
+        // barrier that lands its remote event, the watch must
+        // still report from-cache.
+        sync.note_target_change(&targeted_current(TARGET_ID, 2), TARGET_ID);
+        assert!(!sync.in_sync());
+        sync.note_consistent_point(false);
+        assert!(!sync.in_sync());
+        // The accepted consistent point promotes it.
+        sync.note_consistent_point(true);
+        assert!(sync.in_sync());
+        // A target restart voids currency at once.
+        sync.note_target_restart();
+        assert!(!sync.in_sync());
+        // Re-established by a fresh CURRENT and barrier, then
+        // a RESET voids it at once too.
+        sync.note_target_change(&targeted_current(TARGET_ID, 3), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(sync.in_sync());
+        sync.note_target_change(&target_change(Type::Reset, None, b""), TARGET_ID);
+        assert!(!sync.in_sync());
+    }
+
+    #[test]
+    fn watch_sync_keeps_views_current_through_a_brief_reconnect() {
+        let mut sync = WatchSync::new();
+        sync.on_stream_open();
+        sync.note_target_change(&targeted_current(TARGET_ID, 1), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(sync.in_sync());
+        // The stream fails: Online -> Unknown. Views stay
+        // current and no Offline transition fires.
+        assert!(!sync.on_stream_failure());
+        assert!(sync.in_sync());
+        assert!(sync.offline_deadline().is_some());
+        // The reconnect succeeds: Online again, still in
+        // sync, nothing to deliver.
+        sync.on_stream_open();
+        assert!(sync.in_sync());
+    }
+
+    #[test]
+    fn watch_sync_goes_offline_after_a_failed_reconnect_or_the_timeout() {
+        // A failed reconnect attempt ends the grace.
+        let mut sync = WatchSync::new();
+        sync.on_stream_open();
+        sync.note_target_change(&targeted_current(TARGET_ID, 1), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(!sync.on_stream_failure());
+        assert!(sync.on_stream_failure(), "failed reconnect -> Offline");
+        assert!(!sync.in_sync());
+        // Recovery: a successful stream restores Online, but
+        // going Offline voided the target's currency, so the
+        // stale view is NOT reported in sync on open...
+        sync.on_stream_open();
+        assert!(!sync.in_sync());
+        // ...and a consistent point alone does not restore
+        // it (the pending CURRENT was voided too). Only a
+        // fresh CURRENT plus its barrier does.
+        sync.note_consistent_point(true);
+        assert!(!sync.in_sync());
+        sync.note_target_change(&targeted_current(TARGET_ID, 5), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(sync.in_sync());
+
+        // The Unknown timeout is the other road to Offline,
+        // and it voids the currency the same way.
+        let mut sync = WatchSync::new();
+        sync.on_stream_open();
+        sync.note_target_change(&targeted_current(TARGET_ID, 1), TARGET_ID);
+        sync.note_consistent_point(true);
+        assert!(!sync.on_stream_failure());
+        assert!(sync.on_timeout());
+        assert!(!sync.in_sync());
+        assert!(sync.offline_deadline().is_none());
+        sync.on_stream_open();
+        assert!(!sync.in_sync());
     }
 
     struct OfflineTokens;
