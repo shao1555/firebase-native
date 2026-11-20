@@ -26,10 +26,44 @@ pub(crate) struct HttpClient {
     endpoint: String,
 }
 
+/// Builds the HTTP client used for every Storage call. TLS verification is delegated to
+/// the operating system through `rustls-platform-verifier`
+/// (issue #29): the platform evaluates the certificate
+/// chain (`SecTrust` on Apple platforms, the Windows
+/// certificate store, Android's verifier), so roots
+/// installed by MDM are honoured and verification works
+/// the same inside the macOS App Sandbox, where reading
+/// the trust settings directly (what `rustls-native-certs`
+/// does) does not see them. On Linux the verifier falls
+/// back to the system roots, as before.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls_client_config())
+        .build()
+        .expect("failed to build the HTTP client")
+}
+
+/// The rustls client configuration carrying the platform
+/// verifier, on the ring crypto provider (the provider the
+/// workspace standardizes on; naming it explicitly keeps
+/// the choice independent of which providers the dependency
+/// graph happens to enable).
+fn tls_client_config() -> rustls::ClientConfig {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
+        .expect("platform certificate verifier unavailable");
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("no TLS protocol versions available")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth()
+}
+
 impl HttpClient {
     pub(crate) fn new(tokens: Arc<dyn TokenProvider>, endpoint: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(),
             tokens,
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
         }

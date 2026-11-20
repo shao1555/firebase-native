@@ -10,6 +10,8 @@ repository.workspace = true
 description = "Cloud Storage for Firebase client for firebase-native."
 
 [dependencies]
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 firebase-native-core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

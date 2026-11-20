@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 use firebase_native_core::{App, Error, FirebaseOptions, Result, TokenProvider};
@@ -1254,16 +1254,60 @@ const KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// connection is closed as dead (the gRPC default).
 const KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Builds the shared gRPC channel for an endpoint: native-root TLS
-/// for `https://`, with a CONNECT tunnel when the environment
-/// routes through a proxy (tonic cannot tunnel by itself).
+/// The rustls client configuration for the gRPC transport:
+/// certificate verification delegated to the operating
+/// system through `rustls-platform-verifier` (issue #29) —
+/// the platform evaluates the chain (`SecTrust` on Apple
+/// platforms, the Windows certificate store, Android's
+/// verifier), so MDM-installed roots are honoured and
+/// verification works the same inside the macOS App
+/// Sandbox, where reading the trust settings directly
+/// (what `rustls-native-certs` does) does not see them. On
+/// Linux the verifier falls back to the system roots, as
+/// before. Built on the ring crypto provider (named
+/// explicitly so the choice does not depend on which
+/// providers the dependency graph enables), offering only
+/// the `h2` ALPN, as gRPC requires.
+fn tls_client_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
+        .map_err(|err| Error::Other(format!("platform certificate verifier: {err}")))?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| Error::Other(format!("tls protocol versions: {err}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// A byte stream for the channel connector: plain TCP, or
+/// TLS over TCP (dialed directly, or through a CONNECT
+/// tunnel). The named trait exists so the two shapes can
+/// share one boxed type (a trait object cannot name two
+/// non-auto traits directly).
+trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite> AsyncReadWrite for T {}
+type ChannelStream = std::pin::Pin<Box<dyn AsyncReadWrite + Send>>;
+
+/// Builds the shared gRPC channel for an endpoint.
+///
+/// The channel is built over a custom connector: it dials
+/// with hyper-util's `HttpConnector` — Happy Eyeballs and
+/// `TCP_NODELAY`, as tonic's own transport did — or through
+/// a CONNECT tunnel when the environment routes through a
+/// proxy, and for `https://` endpoints the connector
+/// performs the TLS handshake itself with the platform
+/// verifier (tonic 0.12's `ClientTlsConfig` cannot take a
+/// custom verifier).
 pub(crate) async fn build_channel(endpoint_str: &str) -> Result<Channel> {
     // The dependency graph enables more than one rustls crypto
     // provider, so rustls cannot pick one automatically; select
     // ring as the process default before any TLS config is built
     // (a no-op when a default was already installed).
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut endpoint = Endpoint::from_shared(endpoint_str.to_string())
+    let endpoint = Endpoint::from_shared(endpoint_str.to_string())
         .map_err(|err| Error::Other(format!("invalid endpoint: {err}")))?
         .connect_timeout(CONNECT_TIMEOUT)
         .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
@@ -1274,35 +1318,88 @@ pub(crate) async fn build_channel(endpoint_str: &str) -> Result<Channel> {
         // in Google's clients (no keepalive permit without
         // calls).
         .keep_alive_while_idle(false);
-    if endpoint_str.starts_with("https://") {
-        if let Some(proxy) = endpoint
+    // TLS is this crate's own now, not tonic's: tonic 0.12's
+    // `ClientTlsConfig` can only load root certificates — it
+    // cannot take a custom verifier — so the channel is built
+    // over a connector that dials (directly, or through the
+    // CONNECT proxy when one is configured) and performs the
+    // handshake itself with the platform verifier. The
+    // endpoint's connect timeout bounds the whole connector
+    // future, handshake included.
+    let tls_config = if endpoint_str.starts_with("https://") {
+        Some(tls_client_config()?)
+    } else {
+        None
+    };
+    let proxy = if tls_config.is_some() {
+        endpoint
             .uri()
             .host()
             .and_then(crate::proxy::ProxyConfig::from_env_for)
-        {
-            let proxy = std::sync::Arc::new(proxy);
-            // The connector returns the CONNECT tunnel; this TLS
-            // config runs over it (and is also what makes tonic
-            // accept an https URI).
-            let endpoint = endpoint
-                .tls_config(ClientTlsConfig::new().with_native_roots())
-                .map_err(|err| Error::Other(format!("tls config: {err}")))?;
-            return Ok(endpoint.connect_with_connector_lazy(tower::service_fn(
-                move |uri: tonic::transport::Uri| {
-                    let proxy = proxy.clone();
-                    async move {
-                        let host = uri.host().unwrap_or_default().to_string();
-                        let port = uri.port_u16().unwrap_or(443);
-                        crate::proxy::connect_via_proxy(proxy, host, port).await
+            .map(std::sync::Arc::new)
+    } else {
+        None
+    };
+    // The direct dialer is hyper-util's HttpConnector, as
+    // tonic's own transport used: Happy Eyeballs (an
+    // unresponsive address family falls back after 300 ms
+    // instead of eating the whole connect timeout, which a
+    // sequential TcpStream::connect would allow) and
+    // TCP_NODELAY (small gRPC frames do not wait on Nagle).
+    let mut dialer = hyper_util::client::legacy::connect::HttpConnector::new();
+    dialer.enforce_http(false);
+    dialer.set_nodelay(true);
+    dialer.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    Ok(endpoint.connect_with_connector_lazy(tower::service_fn(
+        move |uri: tonic::transport::Uri| {
+            let tls_config = tls_config.clone();
+            let proxy = proxy.clone();
+            let dialer = dialer.clone();
+            async move {
+                let host = uri.host().unwrap_or_default().to_string();
+                let https = uri.scheme_str() == Some("https");
+                let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+                let tcp = match &proxy {
+                    Some(proxy) => {
+                        crate::proxy::connect_via_proxy(proxy.clone(), host.clone(), port).await?
                     }
-                },
-            )));
-        }
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .map_err(|err| Error::Other(format!("tls config: {err}")))?;
-    }
-    Ok(endpoint.connect_lazy())
+                    None => {
+                        use tower::ServiceExt;
+                        dialer
+                            .oneshot(uri)
+                            .await
+                            .map_err(std::io::Error::other)?
+                            .into_inner()
+                    }
+                };
+                let stream: ChannelStream = match &tls_config {
+                    Some(config) => {
+                        // `Uri::host` keeps the brackets of an
+                        // IPv6 literal; the server name must not
+                        // have them.
+                        let server_host = host
+                            .strip_prefix('[')
+                            .and_then(|rest| rest.strip_suffix(']'))
+                            .unwrap_or(&host)
+                            .to_string();
+                        let server_name = rustls::pki_types::ServerName::try_from(server_host)
+                            .map_err(|err| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    format!("invalid TLS server name: {err}"),
+                                )
+                            })?;
+                        let tls = tokio_rustls::TlsConnector::from(config.clone())
+                            .connect(server_name, tcp)
+                            .await?;
+                        Box::pin(tls)
+                    }
+                    None => Box::pin(tcp),
+                };
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        },
+    )))
 }
 
 /// Generates a random-looking 20-character document ID, the same
@@ -1441,6 +1538,14 @@ mod tests {
             generation, 1,
             "the timed-out call must rebuild the generation"
         );
+    }
+
+    /// The gRPC TLS configuration builds on this platform
+    /// and offers exactly the `h2` ALPN (issue #29).
+    #[test]
+    fn tls_config_uses_platform_verifier_with_h2_alpn() {
+        let config = tls_client_config().expect("the platform verifier config builds");
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
     }
 
     struct StubTokens;
