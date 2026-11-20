@@ -10,6 +10,8 @@ repository.workspace = true
 description = "Firebase Authentication client for firebase-native, over the Identity Toolkit REST API."
 
 [dependencies]
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 firebase-native-core.workspace = true
 aws-lc-rs.workspace = true
 base64 = "0.22"

@@ -99,6 +99,34 @@ with a database-name-mismatch `InvalidArgument`; the
 clients classify that one message as retryable rather than
 terminal.
 
+## TLS verification goes through the OS
+
+Every TLS connection the library opens — the Identity
+Toolkit and Storage REST calls, and the Firestore gRPC
+channel (direct or through the `CONNECT` proxy) — verifies
+certificates through `rustls-platform-verifier`, which asks
+the operating system to evaluate the chain (`SecTrust` on
+Apple platforms, the Windows certificate store, Android's
+verifier). Roots installed by MDM are therefore honoured,
+and verification works the same inside the macOS App
+Sandbox, where reading the trust settings directly (what
+`rustls-native-certs` does) does not see them. On Linux the
+verifier falls back to loading the system roots, as before.
+This matches what the official SDKs effectively do by using
+the platform networking stack.
+
+Two integration notes:
+
+- **Android**: the platform verifier must be initialized
+  from the JVM side (a `Context`) before first use, through
+  `rustls_platform_verifier::android::init_hosted` or
+  `init_external`. The embedding application owns that
+  call; the library cannot make it itself.
+- **Version pin**: `rustls-platform-verifier` is held at
+  0.6 because 0.7 raises its own MSRV to Rust 1.85, above
+  this workspace's 1.75. Revisit the pin when the MSRV
+  moves.
+
 ## MSRV and dependencies
 
 - MSRV is **Rust 1.75**, declared in the workspace

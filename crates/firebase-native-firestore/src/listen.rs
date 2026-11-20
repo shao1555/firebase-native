@@ -4070,6 +4070,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The HTTPS form of the stall check: the server accepts
+    /// TCP and never speaks, so the TLS handshake — which the
+    /// channel connector performs itself, with the platform
+    /// verifier (issue #29) — never completes. The connection
+    /// attempt must be abandoned (by the connect timeout
+    /// bounding the connector, or by the driver's open
+    /// deadline) and redialed, exactly as on the plain-TCP
+    /// path. Only the accept count is asserted: which of the
+    /// two bounds fires first is timing detail, unlike the
+    /// HTTP check, where the gap pins the mechanism.
+    #[tokio::test]
+    async fn stalling_server_https_open_is_abandoned_and_redialed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tcp.incoming() {
+                match stream {
+                    Ok(socket) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        held.push(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        struct Tokens;
+        #[async_trait::async_trait]
+        impl firebase_native_core::TokenProvider for Tokens {
+            async fn id_token(&self, _force_refresh: bool) -> Result<String> {
+                Ok("dummy".to_string())
+            }
+        }
+
+        let app = firebase_native_core::App::new(FirebaseOptions::new("test-key", "demo-project"));
+        let firestore = crate::Firestore::new(&app, Arc::new(Tokens))
+            .with_endpoint(format!("https://127.0.0.1:{port}"));
+        let watch = firestore.watch_document("notes/a").await.unwrap();
+        let mut count = 0;
+        for _ in 0..500 {
+            count = accepts.load(Ordering::SeqCst);
+            if count >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            count >= 3,
+            "hung TLS handshakes were not abandoned and redialed: {count} connection(s)"
+        );
+        drop(watch);
+    }
+
     struct OfflineTokens;
 
     #[async_trait::async_trait]

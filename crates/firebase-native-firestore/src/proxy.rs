@@ -5,16 +5,14 @@
 //! behind corporate proxies need them. When the Firestore endpoint is
 //! `https` and a proxy is configured via `grpc_proxy`, `https_proxy`
 //! or `all_proxy` (lowercase or uppercase; `NO_PROXY` respected), the
-//! channel is built over a connector that tunnels through the proxy
-//! The connector returns the tunnelled TCP stream and `tonic`'s own
-//! TLS configuration performs the handshake over it (native roots),
-//! exactly as on the direct path. Without a proxy in the
-//! environment, the plain `tonic` transport is used unchanged.
+//! channel is built over a connector that tunnels through the proxy.
+//! The connector returns the tunnelled TCP stream and the channel
+//! connector in `client.rs` performs the TLS handshake over it with
+//! the platform verifier, exactly as on the direct path.
 
 use std::io;
 use std::sync::Arc;
 
-use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -85,14 +83,17 @@ fn parse_proxy_url(url: &str) -> Option<ProxyConfig> {
 }
 
 /// Tunnels a TCP connection to `target` through the proxy with
-/// `CONNECT`. TLS is left to `tonic`'s transport configuration,
-/// which wraps the returned stream.
+/// `CONNECT`. TLS is left to the caller (the channel connector
+/// in `client.rs`), which wraps the returned stream.
 pub(crate) async fn connect_via_proxy(
     proxy: Arc<ProxyConfig>,
     target_host: String,
     target_port: u16,
-) -> io::Result<TokioIo<TcpStream>> {
+) -> io::Result<TcpStream> {
     let mut stream = TcpStream::connect(&proxy.addr).await?;
+    // Small gRPC frames should not wait on Nagle, as on the
+    // direct path (where the dialer sets it).
+    stream.set_nodelay(true)?;
     let authority = format!("{target_host}:{target_port}");
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(auth) = &proxy.auth {
@@ -130,7 +131,7 @@ pub(crate) async fn connect_via_proxy(
         ));
     }
 
-    Ok(TokioIo::new(stream))
+    Ok(stream)
 }
 
 /// Standard base64 encoding (for proxy credentials from the URL).
