@@ -625,6 +625,68 @@ impl PersistenceEngine {
         Ok(false)
     }
 
+    /// Whether any queued mutation touches a member of the
+    /// collection group `collection_id` under `parent_relative`
+    /// (at any depth). Group queries use this to decide whether
+    /// the server's answer can be returned as-is or must be
+    /// composed with the local view first.
+    pub(crate) fn has_pending_in_group(
+        &self,
+        parent_relative: &str,
+        collection_id: &str,
+    ) -> Result<bool> {
+        for batch in self.store.peek_batches(usize::MAX)? {
+            let paths = batch.mutations.iter().map(|mutation| mutation.path());
+            if !Self::group_members(parent_relative, collection_id, paths).is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Builds the answer to a group query the server just
+    /// answered: the candidates are the documents the server
+    /// returned plus every document a queued mutation touches
+    /// inside the group, each resolved through the local view
+    /// (a pending write overlays the returned document; a
+    /// pending delete removes it), then filtered, ordered and
+    /// paginated by the query. Unlike [`PersistenceEngine::local_query`]
+    /// this never draws on the wider cache: a document the
+    /// server no longer returns — deleted, changed out of the
+    /// filter, or no longer readable — must not reappear from
+    /// a stale cached copy. The cache-wide evaluation is
+    /// reserved for the connectivity fallback.
+    pub(crate) fn group_query_result(
+        &self,
+        parent_relative: &str,
+        query: &crate::query::Query,
+        returned: &[Document],
+    ) -> Result<Vec<Document>> {
+        let mut keys: Vec<String> = Vec::new();
+        for document in returned {
+            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
+                let relative = relative.strip_prefix('/').unwrap_or(relative);
+                keys.push(relative.to_string());
+            }
+        }
+        for batch in self.store.peek_batches(usize::MAX)? {
+            for mutation in &batch.mutations {
+                keys.push(mutation.path().to_string());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut candidates = Vec::new();
+        for key in Self::group_members(parent_relative, query.collection_id(), key_refs.into_iter())
+        {
+            if let Some(document) = self.local_document(key)? {
+                candidates.push(document);
+            }
+        }
+        Ok(query.evaluate(candidates))
+    }
+
     /// The collection prefix (relative, trailing slash) a query
     /// under `parent_relative` scans: `notes/` at the root,
     /// `spaces/personal/notes/` below a document.
@@ -643,6 +705,40 @@ impl PersistenceEngine {
         keys.filter(|key| {
             key.strip_prefix(prefix)
                 .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
+        .collect()
+    }
+
+    /// The members of a collection group among `keys`
+    /// (relative paths): a key belongs when it sits below
+    /// `parent_relative` (anywhere, when that is empty) and its
+    /// parent collection — the segment before its document ID —
+    /// is `collection_id`, at any depth. The parent document
+    /// itself never belongs: it does not start with the scoped
+    /// prefix, and its own parent collection is outside.
+    fn group_members<'a>(
+        parent_relative: &str,
+        collection_id: &str,
+        keys: impl Iterator<Item = &'a str>,
+    ) -> Vec<&'a str> {
+        keys.filter(|key| {
+            let scoped = if parent_relative.is_empty() {
+                *key
+            } else {
+                match key
+                    .strip_prefix(parent_relative)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
+                    Some(rest) => rest,
+                    None => return false,
+                }
+            };
+            let mut segments = scoped.rsplit('/');
+            // Document ID first, its collection before it; a
+            // bare document ID has no collection inside the
+            // scope and cannot belong.
+            let _document_id = segments.next();
+            segments.next() == Some(collection_id)
         })
         .collect()
     }
@@ -675,8 +771,13 @@ impl PersistenceEngine {
         keys.sort();
         keys.dedup();
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let members = if query.is_collection_group() {
+            Self::group_members(parent_relative, query.collection_id(), key_refs.into_iter())
+        } else {
+            Self::collection_members(&prefix, key_refs.into_iter())
+        };
         let mut candidates = Vec::new();
-        for key in Self::collection_members(&prefix, key_refs.into_iter()) {
+        for key in members {
             if let Some(document) = self.local_document(key)? {
                 candidates.push(document);
             }
@@ -1493,6 +1594,107 @@ mod tests {
             create_time: None,
             update_time: Some(crate::value::Timestamp::new(10, 0)),
         }
+    }
+
+    #[test]
+    fn local_group_query_matches_any_depth_under_the_parent() {
+        let engine = test_engine();
+        // Members of the group at three depths and shapes.
+        engine
+            .store_remote_document(&remote_doc("members/top", 1))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("a/1/members/x", 2))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("b/2/c/3/members/y", 3))
+            .unwrap();
+        // Not members: a different collection ID at the same
+        // shape, and a collection whose ID merely starts with
+        // the group's.
+        engine
+            .store_remote_document(&remote_doc("a/1/others/w", 4))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("a/1/membership/z", 5))
+            .unwrap();
+
+        let group = crate::query::Query::collection_group("members");
+        let results = engine.local_query("", &group).unwrap();
+        let names: Vec<&str> = results
+            .iter()
+            .map(|document| document.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "projects/p/databases/d/documents/a/1/members/x",
+                "projects/p/databases/d/documents/b/2/c/3/members/y",
+                "projects/p/databases/d/documents/members/top",
+            ]
+        );
+
+        // Scoped to one document's subtree, the group outside
+        // it is not returned — including the deeper member
+        // under b/2, which is below b/2 but not below a/1.
+        let scoped = engine.local_query("a/1", &group).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert!(scoped[0].name.ends_with("a/1/members/x"));
+        let scoped = engine.local_query("b/2", &group).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert!(scoped[0].name.ends_with("b/2/c/3/members/y"));
+
+        // Filters apply across the whole group.
+        let filtered = crate::query::Query::collection_group("members")
+            .filter(crate::query::Filter::eq("n", Value::Integer(2)));
+        let results = engine.local_query("", &filtered).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.ends_with("a/1/members/x"));
+
+        // An unacknowledged write joins the group locally.
+        engine
+            .store()
+            .enqueue_batch(&[set("d/4/members/w", 6)])
+            .unwrap();
+        let results = engine.local_query("", &group).unwrap();
+        assert_eq!(results.len(), 4);
+        assert!(results.iter().any(|d| d.name.ends_with("d/4/members/w")));
+    }
+
+    #[test]
+    fn group_query_result_composes_returned_with_pending_only() {
+        let engine = test_engine();
+        engine
+            .store_remote_document(&remote_doc("a/1/members/x", 1))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("a/1/members/stale", 2))
+            .unwrap();
+        let group = crate::query::Query::collection_group("members");
+
+        // The server returned only x: the cached `stale`,
+        // which the server no longer returns, is not in the
+        // answer even though it sits in the cache.
+        let returned = vec![remote_doc("a/1/members/x", 1)];
+        let results = engine.group_query_result("", &group, &returned).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.ends_with("a/1/members/x"));
+
+        // A pending delete removes even a returned document;
+        // a pending write elsewhere in the group joins.
+        engine
+            .store()
+            .enqueue_batch(&[Mutation::Delete {
+                path: "a/1/members/x".to_string(),
+            }])
+            .unwrap();
+        engine
+            .store()
+            .enqueue_batch(&[set("d/4/members/w", 6)])
+            .unwrap();
+        let results = engine.group_query_result("", &group, &returned).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.ends_with("d/4/members/w"));
     }
 
     #[test]

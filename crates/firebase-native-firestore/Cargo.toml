@@ -37,3 +37,8 @@ tower = { version = "0.5", features = ["util"] }
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
+
+[dev-dependencies]
+bytes = "1"
+h2 = "0.4"
+http = "1"

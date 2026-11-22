@@ -93,6 +93,43 @@ candidates with server-identical semantics (including the
 total order above). That is what makes local-first reads
 below possible.
 
+### Collection groups
+
+`Query::collection_group("members")` queries every
+collection with that ID at any depth below the parent —
+the shape for per-user subcollections scattered over the
+tree (`projects/{p}/items/{i}/members/{uid}`,
+`teams/{t}/members/{uid}`), typically filtered by a field
+such as the user's ID. `run_query("", group)` searches
+the whole database. The parent must be empty: the server
+only allows collection group queries at the root parent
+(the emulator rejects a document parent outright, and the
+official SDKs expose no scoped form), so `run_query`
+refuses a non-empty parent for a group query with an
+`InvalidArgument` error rather than sending it.
+
+Two differences from single-collection queries:
+
+- With the local store on, a group query always asks the
+  server first — no single cached collection stands for
+  the group, so the local-first shortcut does not apply.
+  The answer is built from the documents the server
+  returned, never from the wider cache: a document the
+  server no longer returns (deleted, changed out of the
+  filter, no longer readable) cannot reappear from a
+  stale cached copy, and a document added on the server
+  between two calls appears in the second. Queued writes
+  inside the group are composed into the answer (a
+  pending write overlays the returned document, a pending
+  delete removes it); only a connectivity failure answers
+  from the cache alone. When nothing is pending, the
+  fetch keeps the query's limit and offset; when writes
+  are pending it goes unpaginated and the composition
+  applies them exactly once.
+- Listeners do not support group queries yet:
+  `watch_query` rejects one with an error instead of
+  tracking only part of the group.
+
 ## Watches and snapshot metadata
 
 ```rust
