@@ -825,10 +825,15 @@ impl Firestore {
     ///
     /// In persistent mode the local store answers, mirroring
     /// `get_document`'s rule: when the store knows the collection
-    /// (a cached document or a queued mutation in it), the query
-    /// is evaluated over the local views — unacknowledged writes
-    /// included — and no network call is made. When the store
-    /// knows nothing about the collection, an online query runs
+    /// — a server sync has established its full contents and no
+    /// eviction has since cut into it — the query is evaluated
+    /// over the local views
+    /// — unacknowledged writes included — and no network call
+    /// is made. A merely *cached* document does not make the
+    /// collection known: filtered and group refills cache
+    /// proper subsets, and answering from one would silently
+    /// drop the rest (issue #33). When the store does not know
+    /// the collection, an online query runs
     /// first (unpaginated, so the local evaluation applies
     /// offset/limit exactly once), its results are cached, and
     /// the answer is the local evaluation over the filled store;
@@ -879,14 +884,27 @@ impl Firestore {
                 } else {
                     query.clone()
                 };
+                // Capture the local-state generation before
+                // the fetch, as get_document does: a landing
+                // while it is in flight (a write acknowledged,
+                // a watch delivery) means the response
+                // describes an older read point, and the
+                // answer must be composed rather than taken
+                // as final.
+                let generation = engine.generation();
                 return match self.run_query_online(parent_path, fetch).await {
                     Ok(documents) => {
+                        // Compare generations before the fill:
+                        // storing the returned documents bumps
+                        // it, so the raced check must read the
+                        // state the fetch landed into.
+                        let raced = engine.generation() != generation;
                         let _landing = engine.landing_guard();
                         for document in &documents {
                             engine.store_remote_document(document)?;
                         }
                         engine.note_cache_fill();
-                        if pending {
+                        if pending || raced {
                             engine.group_query_result(parent_path, &query, &documents)
                         } else {
                             Ok(documents)
@@ -901,11 +919,25 @@ impl Firestore {
             if engine.collection_known(parent_path, query.collection_id())? {
                 return engine.local_query(parent_path, &query);
             }
+            // Capture the local-state generation before the
+            // fetch, as get_document does: a landing while it
+            // is in flight (a write acknowledged, a watch
+            // delivery) means the response describes an older
+            // read point than the current local state, so the
+            // refill must neither evict (the "ghost" may be a
+            // just-acknowledged create the read point predates)
+            // nor record completeness from it.
+            let generation = engine.generation();
             match self
                 .run_query_online(parent_path, query.without_pagination())
                 .await
             {
                 Ok(documents) => {
+                    // Compare generations before the fill:
+                    // storing the returned documents bumps it,
+                    // so the raced check must read the state the
+                    // fetch landed into.
+                    let raced = engine.generation() != generation;
                     // Fill + evaluate under the landing guard:
                     // the fill wakes the garbage collector, and
                     // a pass must not evict a just-filled
@@ -915,18 +947,39 @@ impl Firestore {
                     for document in &documents {
                         engine.store_remote_document(document)?;
                     }
-                    // The refill re-establishes the
-                    // collection's completeness only when the
-                    // server query covered the entire
-                    // collection (the fetch strips pagination,
-                    // but filters and ordering bounds remain),
-                    // and the fill itself is cache growth the
-                    // garbage collector should hear about.
-                    if query.covers_entire_collection() {
-                        engine.note_collection_synced(parent_path, query.collection_id());
-                    }
                     engine.note_cache_fill();
-                    return engine.local_query(parent_path, &query);
+                    if raced
+                        || engine.has_pending_in_collection(parent_path, query.collection_id())?
+                    {
+                        // Pending writes touch the collection,
+                        // or a landing raced the fetch: the
+                        // answer is the server's result
+                        // composed with the queued mutations,
+                        // never the wider cache — cached
+                        // documents the server did not return
+                        // may be ghosts (deleted or no longer
+                        // readable on the server).
+                        return engine.collection_query_result(parent_path, &query, &documents);
+                    }
+                    if query.covers_entire_collection() {
+                        // The fetch saw the entire collection:
+                        // evict the ghosts it did not return,
+                        // so the completeness recorded below is
+                        // true of the cache as well, then answer
+                        // from the (now exact) local view.
+                        engine.reconcile_collection(
+                            parent_path,
+                            query.collection_id(),
+                            &documents,
+                        )?;
+                        engine.note_collection_synced(parent_path, query.collection_id());
+                        return engine.local_query(parent_path, &query);
+                    }
+                    // A filtered refill, nothing pending: the
+                    // answer is the server's result itself
+                    // (evaluated once for ordering and
+                    // pagination), not the wider cache.
+                    return Ok(query.evaluate(documents));
                 }
                 Err(error) if crate::listen::is_transient_error(&error) => {
                     return engine.local_query(parent_path, &query);
@@ -1652,9 +1705,11 @@ mod tests {
             .with_endpoint(format!("http://127.0.0.1:{port}"))
             .enable_local_store(&store_path)
             .unwrap();
-        // Seed a root-level `members` document, so the
-        // concrete collection is known to the store.
+        // Seed a root-level `members` document and record
+        // the collection as fully synced, so the concrete
+        // collection is known-complete to the store.
         let engine = firestore.engine.clone().unwrap();
+        engine.note_collection_synced("", "members");
         engine
             .store_remote_document(&crate::value::Document {
                 name: "projects/test-project/databases/(default)/documents/members/x".to_string(),
@@ -1728,6 +1783,25 @@ mod tests {
         port: u16,
         canned: Arc<std::sync::Mutex<Vec<crate::google::firestore::v1::Document>>>,
         captured: Arc<std::sync::Mutex<Option<crate::google::firestore::v1::StructuredQuery>>>,
+        requests: Arc<std::sync::Mutex<usize>>,
+        hold_armed: Arc<std::sync::Mutex<bool>>,
+        hold_sem: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl FakeRunQueryServer {
+        /// Holds the next responses until `release_hold`:
+        /// the request is decoded (and counted) but the
+        /// response frames wait, so a test can land local
+        /// state while a fetch is deterministically in
+        /// flight.
+        fn arm_hold(&self) {
+            *self.hold_armed.lock().unwrap() = true;
+        }
+
+        fn release_hold(&self) {
+            *self.hold_armed.lock().unwrap() = false;
+            self.hold_sem.add_permits(1);
+        }
     }
 
     async fn spawn_fake_run_query_server() -> FakeRunQueryServer {
@@ -1736,10 +1810,16 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured: Arc<std::sync::Mutex<Option<crate::google::firestore::v1::StructuredQuery>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let requests: Arc<std::sync::Mutex<usize>> = Arc::new(std::sync::Mutex::new(0));
+        let hold_armed: Arc<std::sync::Mutex<bool>> = Arc::new(std::sync::Mutex::new(false));
+        let hold_sem: Arc<tokio::sync::Semaphore> = Arc::new(tokio::sync::Semaphore::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_canned = canned.clone();
         let server_captured = captured.clone();
+        let server_requests = requests.clone();
+        let server_hold_armed = hold_armed.clone();
+        let server_hold_sem = hold_sem.clone();
         tokio::spawn(async move {
             loop {
                 let (socket, _) = match listener.accept().await {
@@ -1748,6 +1828,9 @@ mod tests {
                 };
                 let canned = server_canned.clone();
                 let captured = server_captured.clone();
+                let requests = server_requests.clone();
+                let hold_armed = server_hold_armed.clone();
+                let hold_sem = server_hold_sem.clone();
                 tokio::spawn(async move {
                     let mut connection = match h2::server::handshake(socket).await {
                         Ok(connection) => connection,
@@ -1760,6 +1843,9 @@ mod tests {
                         };
                         let canned = canned.clone();
                         let captured = captured.clone();
+                        let requests = requests.clone();
+                        let hold_armed = hold_armed.clone();
+                        let hold_sem = hold_sem.clone();
                         tokio::spawn(async move {
                             let mut body = request.into_body();
                             let mut data = Vec::new();
@@ -1784,6 +1870,10 @@ mod tests {
                                         ),
                                     ) = run_query.query_type
                                     {
+                                        *requests.lock().unwrap() += 1;
+                                        if *hold_armed.lock().unwrap() {
+                                            let _ = hold_sem.acquire().await;
+                                        }
                                         *captured.lock().unwrap() = Some(structured);
                                     }
                                 }
@@ -1827,6 +1917,9 @@ mod tests {
             port,
             canned,
             captured,
+            requests,
+            hold_armed,
+            hold_sem,
         }
     }
 
@@ -1977,6 +2070,249 @@ mod tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    /// The #33 repro: a filtered group refill caches one
+    /// member of `a/1/members`; a later single-collection
+    /// query over that collection must still ask the server
+    /// (the cache is partial), and only an unfiltered,
+    /// unbounded fetch makes the collection known-complete,
+    /// after which the same query answers locally.
+    #[tokio::test]
+    async fn group_refill_does_not_make_a_collection_known() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) = persistent_firestore(
+            &format!("http://127.0.0.1:{}", server.port),
+            "group-partial",
+        );
+        let prefix = "projects/test-project/databases/(default)/documents";
+        let member_x = proto_document(&format!("{prefix}/a/1/members/x"), "u1");
+        let member_o = proto_document(&format!("{prefix}/a/1/members/o"), "u2");
+
+        // The group query (filtered to u1) returns and
+        // caches only x.
+        *server.canned.lock().unwrap() = vec![member_x.clone()];
+        let results = firestore
+            .run_query(
+                "",
+                Query::collection_group("members").filter(crate::query::Filter::eq(
+                    "uid",
+                    Value::String("u1".to_string()),
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(*server.requests.lock().unwrap(), 1);
+
+        // The single-collection query over a/1/members goes
+        // online despite the cached x, and sees o too.
+        *server.canned.lock().unwrap() = vec![member_x, member_o];
+        let results = firestore
+            .run_query("a/1", Query::new("members"))
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "the partial cache must not answer for the collection"
+        );
+        assert_eq!(*server.requests.lock().unwrap(), 2);
+
+        // That fetch was unfiltered and unbounded, so the
+        // collection is now known-complete: the same query
+        // answers locally, with no further request.
+        let results = firestore
+            .run_query("a/1", Query::new("members"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            *server.requests.lock().unwrap(),
+            2,
+            "a known-complete collection must not dial"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The review scenario on PR #35: a filtered refill
+    /// caches `d/1/items/p`; the server then deletes p and
+    /// adds q. The unfiltered query must answer [q] only,
+    /// the ghost must be evicted from the cache (not just
+    /// excluded from this answer), and the completeness the
+    /// refill records must hold for later local answers.
+    #[tokio::test]
+    async fn full_refill_evicts_ghosts_before_recording_completeness() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) =
+            persistent_firestore(&format!("http://127.0.0.1:{}", server.port), "ghost-refill");
+        let prefix = "projects/test-project/databases/(default)/documents";
+        let item_p = proto_document(&format!("{prefix}/d/1/items/p"), "u1");
+        let item_q = proto_document(&format!("{prefix}/d/1/items/q"), "u2");
+
+        *server.canned.lock().unwrap() = vec![item_p];
+        let results = firestore
+            .run_query(
+                "d/1",
+                Query::new("items").filter(crate::query::Filter::eq(
+                    "uid",
+                    Value::String("u1".to_string()),
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(*server.requests.lock().unwrap(), 1);
+
+        *server.canned.lock().unwrap() = vec![item_q];
+        let results = firestore
+            .run_query("d/1", Query::new("items"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].name.ends_with("/items/q"),
+            "the ghost p must not widen the answer: {:?}",
+            results[0].name
+        );
+        assert_eq!(*server.requests.lock().unwrap(), 2);
+        let engine = firestore.engine.clone().unwrap();
+        assert!(
+            engine.local_document("d/1/items/p").unwrap().is_none(),
+            "the ghost must be evicted, not just excluded"
+        );
+
+        // The recorded completeness is now true of the
+        // cache: the same query answers locally, still [q].
+        let results = firestore
+            .run_query("d/1", Query::new("items"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(*server.requests.lock().unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filtered refill answers from the server's result,
+    /// not the wider cache: a cached document that matches
+    /// the filter but was deleted on the server stays out.
+    #[tokio::test]
+    async fn filtered_refill_answers_from_the_server_result() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) = persistent_firestore(
+            &format!("http://127.0.0.1:{}", server.port),
+            "filtered-result",
+        );
+        let prefix = "projects/test-project/databases/(default)/documents";
+        // Seed the ghost directly: it matches the filter,
+        // so a cache-wide answer would include it.
+        let engine = firestore.engine.clone().unwrap();
+        engine
+            .store_remote_document(
+                &Document::from_proto(proto_document(&format!("{prefix}/items/z"), "u1")).unwrap(),
+            )
+            .unwrap();
+        *server.canned.lock().unwrap() = Vec::new();
+        let results = firestore
+            .run_query(
+                "",
+                Query::new("items").filter(crate::query::Filter::eq(
+                    "uid",
+                    Value::String("u1".to_string()),
+                )),
+            )
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "the server returned nothing; the ghost must not answer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The race the generation guard closes: a write is
+    /// acknowledged while a full refill's fetch is in
+    /// flight. The fetch's read point predates the commit,
+    /// so the acknowledged document is not in the answer —
+    /// but it must not be evicted as a ghost either, and
+    /// the raced fetch must not record completeness.
+    #[tokio::test]
+    async fn fetch_raced_by_an_acknowledgement_evicts_and_records_nothing() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) =
+            persistent_firestore(&format!("http://127.0.0.1:{}", server.port), "raced-refill");
+        let firestore = std::sync::Arc::new(firestore);
+        let engine = firestore.engine.clone().unwrap();
+        let prefix = "projects/test-project/databases/(default)/documents";
+        let item_a = proto_document(&format!("{prefix}/items/a"), "u1");
+        let item_new = proto_document(&format!("{prefix}/items/new"), "u1");
+
+        *server.canned.lock().unwrap() = vec![item_a.clone()];
+        server.arm_hold();
+        let querying = {
+            let firestore = firestore.clone();
+            tokio::spawn(async move { firestore.run_query("", Query::new("items")).await })
+        };
+        // Wait until the request has reached the server and
+        // is being held.
+        for _ in 0..200 {
+            if *server.requests.lock().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*server.requests.lock().unwrap(), 1);
+
+        // The app writes items/new; the write is
+        // acknowledged while the fetch is in flight, landing
+        // in the server-confirmed cache and leaving the
+        // queue.
+        let mut fields = crate::Fields::new();
+        fields.insert("uid".to_string(), Value::String("u1".to_string()));
+        engine
+            .store()
+            .enqueue_batch(&[crate::mutation::Mutation::Set {
+                path: "items/new".to_string(),
+                fields,
+                merge_paths: None,
+                exists: None,
+                transforms: Vec::new(),
+            }])
+            .unwrap();
+        let batch = engine
+            .store()
+            .peek_batches(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        engine
+            .fold_acknowledgement(&batch, crate::value::Timestamp::new(1_700_000_000, 0))
+            .unwrap();
+        server.release_hold();
+
+        // The answer is the composition (just a; new joins
+        // on the next call), but the acknowledged create
+        // survives in the cache and no completeness was
+        // recorded from the raced fetch.
+        let results = querying.await.unwrap().unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            engine.local_document("items/new").unwrap().is_some(),
+            "the acknowledged create must not be evicted as a ghost"
+        );
+        assert!(
+            !engine.collection_known("", "items").unwrap(),
+            "a raced fetch must not record completeness"
+        );
+
+        // The next call goes online again and sees both.
+        *server.canned.lock().unwrap() = vec![item_a, item_new];
+        let results = firestore.run_query("", Query::new("items")).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(*server.requests.lock().unwrap(), 2);
+        assert!(engine.collection_known("", "items").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct StubTokens;

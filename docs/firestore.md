@@ -276,7 +276,14 @@ eviction cut into is marked *incomplete*, so local-first
 a partial view (only a sync covering the *entire*
 collection — an unfiltered, unbounded watch sync or
 online refill — clears the mark; a filtered watch
-legitimately never sees the rest); and a closed watch
+legitimately never sees the rest). The same sync is also
+what makes a collection *known* in the first place:
+completeness is recorded positively, so a collection
+that was never fully synced — one holding only a
+filtered query's matches, a single fetched document, or
+a collection group refill's scattered members — is
+refilled too, never answered from its partial cache;
+and a closed watch
 whose cached baseline lost a document has its
 resume-token state deleted — a resumed
 Listen delivers only deltas, so the token must never be

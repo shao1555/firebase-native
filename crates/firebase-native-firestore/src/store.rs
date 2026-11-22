@@ -26,6 +26,13 @@
 //!   removed some of their documents; local-first query
 //!   evaluation must not trust them until a server sync
 //!   refills them.
+//! - `complete_collections` — collections whose full
+//!   contents a server sync has established (the positive
+//!   record `incomplete_collections` alone could not
+//!   express: a cached document proves presence, never
+//!   completeness). Local-first query evaluation trusts a
+//!   collection only while it is recorded here and not
+//!   marked incomplete; eviction removes the record.
 //!
 //! The crate chooses no location: the embedding application passes
 //! the file path, which is also how the shell keeps session/storage
@@ -140,6 +147,9 @@ impl LocalStore {
                  target_key INTEGER PRIMARY KEY
              );
              CREATE TABLE IF NOT EXISTS incomplete_collections (
+                 collection_key TEXT PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS complete_collections (
                  collection_key TEXT PRIMARY KEY
              );",
         )
@@ -606,6 +616,35 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Records that a server sync established a
+    /// collection's full contents.
+    pub(crate) fn mark_collection_complete(&self, collection_key: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO complete_collections (collection_key)
+             VALUES (?1) ON CONFLICT(collection_key) DO NOTHING",
+            params![collection_key],
+        )
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    /// Whether a server sync has established a collection's
+    /// full contents (and no eviction has since revoked it —
+    /// eviction deletes the record as it marks the
+    /// collection incomplete).
+    pub(crate) fn collection_complete(&self, collection_key: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM complete_collections WHERE collection_key = ?1",
+                params![collection_key],
+                |row| row.get(0),
+            )
+            .map_err(store_error)?;
+        Ok(count > 0)
+    }
+
     /// Whether a collection's cached contents are known to
     /// be partial.
     pub(crate) fn collection_incomplete(&self, collection_key: &str) -> Result<bool> {
@@ -808,6 +847,12 @@ impl LocalStore {
                         .execute(
                             "INSERT INTO incomplete_collections (collection_key)
                              VALUES (?1) ON CONFLICT(collection_key) DO NOTHING",
+                            params![collection_key],
+                        )
+                        .map_err(store_error)?;
+                    transaction
+                        .execute(
+                            "DELETE FROM complete_collections WHERE collection_key = ?1",
                             params![collection_key],
                         )
                         .map_err(store_error)?;
