@@ -154,13 +154,17 @@ impl PersistenceEngine {
         }
     }
 
-    /// Records that a server sync re-established a
+    /// Records that a server sync established a
     /// collection's full contents (a watch reaching a
     /// consistent point, an online query refill): clears the
-    /// known-partial mark eviction may have set.
+    /// known-partial mark eviction may have set, and records
+    /// the completeness positively, so local-first reads can
+    /// tell a fully synced collection from a merely cached
+    /// subset (issue #33).
     pub(crate) fn note_collection_synced(&self, parent_relative: &str, collection_id: &str) {
         let key = Self::collection_key(parent_relative, collection_id);
         let _ = self.store.clear_collection_incomplete(&key);
+        let _ = self.store.mark_collection_complete(&key);
     }
 
     /// The incomplete-tracking key of a collection: its full
@@ -687,6 +691,80 @@ impl PersistenceEngine {
         Ok(query.evaluate(candidates))
     }
 
+    /// The single-collection counterpart of
+    /// [`PersistenceEngine::group_query_result`]: the same
+    /// composition (the server's returned documents plus
+    /// this collection's queued mutations, resolved through
+    /// the local views), for a refill whose answer must not
+    /// be widened to the whole cache — cached documents the
+    /// server did not return may be ghosts (deleted or no
+    /// longer readable on the server).
+    pub(crate) fn collection_query_result(
+        &self,
+        parent_relative: &str,
+        query: &crate::query::Query,
+        returned: &[Document],
+    ) -> Result<Vec<Document>> {
+        let prefix = Self::collection_prefix(parent_relative, query.collection_id());
+        let mut keys: Vec<String> = Vec::new();
+        for document in returned {
+            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
+                let relative = relative.strip_prefix('/').unwrap_or(relative);
+                keys.push(relative.to_string());
+            }
+        }
+        for batch in self.store.peek_batches(usize::MAX)? {
+            for mutation in &batch.mutations {
+                keys.push(mutation.path().to_string());
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut candidates = Vec::new();
+        for key in Self::collection_members(&prefix, key_refs.into_iter()) {
+            if let Some(document) = self.local_document(key)? {
+                candidates.push(document);
+            }
+        }
+        Ok(query.evaluate(candidates))
+    }
+
+    /// Removes cached members of a collection that a full
+    /// server answer did not return (ghosts: deleted or no
+    /// longer readable on the server), so recording the
+    /// collection's completeness afterwards is true of the
+    /// cache as well. The caller guarantees no queued
+    /// mutation touches the collection, so no pending view
+    /// can lose its base here.
+    pub(crate) fn reconcile_collection(
+        &self,
+        parent_relative: &str,
+        collection_id: &str,
+        returned: &[Document],
+    ) -> Result<()> {
+        let prefix = Self::collection_prefix(parent_relative, collection_id);
+        let mut returned_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for document in returned {
+            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
+                let relative = relative.strip_prefix('/').unwrap_or(relative);
+                returned_keys.insert(relative.to_string());
+            }
+        }
+        for document in self.store.all_remote_documents()? {
+            let Some(relative) = document.name.strip_prefix(&self.documents_prefix) else {
+                continue;
+            };
+            let relative = relative.strip_prefix('/').unwrap_or(relative);
+            if !Self::collection_members(&prefix, [relative].into_iter()).is_empty()
+                && !returned_keys.contains(relative)
+            {
+                self.store_remote_absent_name(&document.name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The collection prefix (relative, trailing slash) a query
     /// under `parent_relative` scans: `notes/` at the root,
     /// `spaces/personal/notes/` below a document.
@@ -785,43 +863,38 @@ impl PersistenceEngine {
         Ok(query.evaluate(candidates))
     }
 
-    /// Whether the store knows anything about a collection: at
-    /// least one server-confirmed document in it, or a queued
-    /// mutation touching one of its documents. Reads use this to
-    /// decide whether a local answer can be trusted as complete
-    /// or an online fetch must fill the gap first (mirroring
-    /// `get_document`'s local-first rule).
+    /// Whether a local answer for a collection can be
+    /// trusted as complete: a server sync established its
+    /// full contents and no eviction has since cut into it.
+    /// Reads use this to decide whether a local answer can
+    /// be trusted or an online fetch must run first
+    /// (mirroring `get_document`'s local-first rule).
     pub(crate) fn collection_known(
         &self,
         parent_relative: &str,
         collection_id: &str,
     ) -> Result<bool> {
+        let key = Self::collection_key(parent_relative, collection_id);
         // A collection eviction cut into is known-partial:
         // the local view must not be trusted as complete
         // until a server sync refills it.
-        if self
-            .store
-            .collection_incomplete(&Self::collection_key(parent_relative, collection_id))?
-        {
+        if self.store.collection_incomplete(&key)? {
             return Ok(false);
         }
-        let prefix = Self::collection_prefix(parent_relative, collection_id);
-        for document in self.store.all_remote_documents()? {
-            if let Some(relative) = document.name.strip_prefix(&self.documents_prefix) {
-                let relative = relative.strip_prefix('/').unwrap_or(relative);
-                if !Self::collection_members(&prefix, [relative].into_iter()).is_empty() {
-                    return Ok(true);
-                }
-            }
-        }
-        for batch in self.store.peek_batches(usize::MAX)? {
-            for mutation in &batch.mutations {
-                if !Self::collection_members(&prefix, [mutation.path()].into_iter()).is_empty() {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        // Completeness is positive knowledge, and it is the
+        // only basis for trusting a local answer: a server
+        // sync established the collection's full contents (a
+        // watch covering the entire collection, an unfiltered
+        // unbounded refill) and no eviction has since revoked
+        // the record. A cached document proves presence,
+        // never completeness — filtered refills and group
+        // refills cache proper subsets (issue #33) — and a
+        // queued mutation proves nothing about the rest of
+        // the collection either: the online refill overlays
+        // pending writes, and the transient-error fallback
+        // answers from the cache when offline, so local-first
+        // trust needs no queue clause.
+        self.store.collection_complete(&key)
     }
 
     /// Records a server-confirmed document (e.g. an online fetch
@@ -1110,6 +1183,9 @@ mod tests {
             )
             .unwrap();
         engine.unregister_target(42);
+        // The watch's full sync established the collection's
+        // completeness while it was open.
+        engine.note_collection_synced("", "notes");
         assert!(engine.collection_known("", "notes").unwrap());
         engine.collect_garbage_if_needed();
         // a (LRU) was evicted: the baseline is broken, so the
@@ -1739,19 +1815,94 @@ mod tests {
     }
 
     #[test]
-    fn collection_known_reflects_cache_and_queue() {
+    fn collection_known_requires_a_completeness_record() {
         let engine = test_engine();
         assert!(!engine.collection_known("", "notes").unwrap());
         assert!(!engine.collection_known("spaces/personal", "notes").unwrap());
+        // A cached document proves presence, never
+        // completeness (issue #33): the collection is not
+        // known until a full sync establishes it.
         engine
             .store_remote_document(&remote_doc("notes/a", 1))
             .unwrap();
+        assert!(!engine.collection_known("", "notes").unwrap());
+        engine.note_collection_synced("", "notes");
         assert!(engine.collection_known("", "notes").unwrap());
-        // The cache row belongs to the root collection only.
+        // The record belongs to the root collection only.
         assert!(!engine.collection_known("spaces/personal", "notes").unwrap());
-        // A queued mutation also marks its collection known.
+        // A queued mutation does NOT mark its collection
+        // known: it proves nothing about the rest of the
+        // collection, and the online refill / offline
+        // fallback already cover pending writes.
         engine.store().enqueue_batch(&[set("other/x", 1)]).unwrap();
-        assert!(engine.collection_known("", "other").unwrap());
+        assert!(!engine.collection_known("", "other").unwrap());
+    }
+
+    #[test]
+    fn collection_query_result_composes_returned_with_pending_only() {
+        let engine = test_engine();
+        // A stale cached member the server no longer
+        // returns, the returned member, and a queued write.
+        engine
+            .store_remote_document(&remote_doc("items/a", 1))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("items/b", 2))
+            .unwrap();
+        engine.store().enqueue_batch(&[set("items/c", 3)]).unwrap();
+        let query = crate::query::Query::new("items");
+        let returned = vec![remote_doc("items/b", 2)];
+        let names: Vec<String> = engine
+            .collection_query_result("", &query, &returned)
+            .unwrap()
+            .iter()
+            .map(|d| d.name.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["b".to_string(), "c".to_string()],
+            "the ghost must not widen the answer"
+        );
+        // A queued delete of the returned member removes it.
+        engine
+            .store()
+            .enqueue_batch(&[Mutation::Delete {
+                path: "items/b".to_string(),
+            }])
+            .unwrap();
+        let names: Vec<String> = engine
+            .collection_query_result("", &query, &returned)
+            .unwrap()
+            .iter()
+            .map(|d| d.name.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_collection_evicts_only_absent_members() {
+        let engine = test_engine();
+        engine
+            .store_remote_document(&remote_doc("items/a", 1))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("items/b", 2))
+            .unwrap();
+        engine
+            .store_remote_document(&remote_doc("other/a", 9))
+            .unwrap();
+        engine
+            .reconcile_collection("", "items", &[remote_doc("items/b", 2)])
+            .unwrap();
+        assert!(
+            engine.local_document("items/a").unwrap().is_none(),
+            "the absent member is a ghost and must go"
+        );
+        assert!(engine.local_document("items/b").unwrap().is_some());
+        assert!(
+            engine.local_document("other/a").unwrap().is_some(),
+            "other collections are untouched"
+        );
     }
 
     #[test]
