@@ -308,6 +308,11 @@ impl Firestore {
         parent_path: &str,
         query: Query,
     ) -> Result<crate::listen::Listener> {
+        if query.is_collection_group() {
+            return Err(Error::Other(
+                "collection-group queries cannot be listened to yet".to_string(),
+            ));
+        }
         let parent = if parent_path.is_empty() {
             self.options.documents_prefix()
         } else {
@@ -828,11 +833,68 @@ impl Firestore {
     /// evaluation — possibly empty — is the answer rather than
     /// an error. Validation and terminal service errors always
     /// propagate.
+    ///
+    /// A collection-group query ([`Query::collection_group`],
+    /// root parent only — see below) is the exception to the
+    /// local-first rule: no single
+    /// cached collection stands for the group, so persistent
+    /// mode always runs the online query first and caches its
+    /// results. The answer is built from the documents the
+    /// server returned — never from the wider cache, so a
+    /// document the server no longer returns (deleted,
+    /// changed out of the filter, no longer readable) cannot
+    /// reappear from a stale cached copy. When a queued
+    /// mutation touches the group, the returned documents are
+    /// composed with the local view (pending writes overlay,
+    /// pending deletes remove) and the query's pagination
+    /// applies to the composition, so the fetch itself goes
+    /// unpaginated; with nothing pending, the server's answer
+    /// is final and the fetch keeps the query's pagination.
+    /// Only a connectivity failure answers from the cache
+    /// alone (the whole cached group, locally evaluated).
     pub async fn run_query(&self, parent_path: &str, query: Query) -> Result<Vec<Document>> {
         if !parent_path.is_empty() {
             validate_document_path(parent_path)?;
         }
+        if query.is_collection_group() && !parent_path.is_empty() {
+            // The server only allows collection group queries
+            // at the root parent (the emulator rejects a
+            // document parent with exactly this message, and
+            // the official SDKs expose no scoped form), so
+            // refuse here rather than send a query that cannot
+            // run — or, worse, answer it from the local
+            // fallback as if it had.
+            return Err(Error::InvalidArgument(
+                "collection group queries are only allowed at the root parent".to_string(),
+            ));
+        }
         if let Some(engine) = &self.engine {
+            if query.is_collection_group() {
+                let pending = engine.has_pending_in_group(parent_path, query.collection_id())?;
+                let fetch = if pending {
+                    query.without_pagination()
+                } else {
+                    query.clone()
+                };
+                return match self.run_query_online(parent_path, fetch).await {
+                    Ok(documents) => {
+                        let _landing = engine.landing_guard();
+                        for document in &documents {
+                            engine.store_remote_document(document)?;
+                        }
+                        engine.note_cache_fill();
+                        if pending {
+                            engine.group_query_result(parent_path, &query, &documents)
+                        } else {
+                            Ok(documents)
+                        }
+                    }
+                    Err(error) if crate::listen::is_transient_error(&error) => {
+                        engine.local_query(parent_path, &query)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             if engine.collection_known(parent_path, query.collection_id())? {
                 return engine.local_query(parent_path, &query);
             }
@@ -1546,6 +1608,365 @@ mod tests {
     fn tls_config_uses_platform_verifier_with_h2_alpn() {
         let config = tls_client_config().expect("the platform verifier config builds");
         assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    /// A collection-group query always asks the server
+    /// first, even when the store knows a concrete collection
+    /// with the group's ID (issue #31): the counting server
+    /// stalls, so the group call surfaces as a dial plus the
+    /// transient-deadline fallback to the local group
+    /// evaluation, while the single-collection query over the
+    /// same known collection never dials.
+    #[tokio::test]
+    async fn group_query_goes_online_even_when_a_member_collection_is_known() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tcp.incoming() {
+                match stream {
+                    Ok(socket) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        held.push(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "firebase-native-group-query-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+        let app = App::new(FirebaseOptions::new("test-key", "test-project"));
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint(format!("http://127.0.0.1:{port}"))
+            .enable_local_store(&store_path)
+            .unwrap();
+        // Seed a root-level `members` document, so the
+        // concrete collection is known to the store.
+        let engine = firestore.engine.clone().unwrap();
+        engine
+            .store_remote_document(&crate::value::Document {
+                name: "projects/test-project/databases/(default)/documents/members/x".to_string(),
+                fields: crate::Fields::new(),
+                create_time: None,
+                update_time: None,
+            })
+            .unwrap();
+
+        // The single-collection query answers locally.
+        let results = firestore
+            .run_query("", Query::new("members"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "a known collection must not dial"
+        );
+
+        // The group query consults the server (a dial
+        // happens), then falls back to the local evaluation
+        // when the stalled call hits its deadline.
+        let results = firestore
+            .run_query("", Query::collection_group("members"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the group query never consulted the server"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Listeners reject collection-group queries until they
+    /// learn group matching (issue #31, step 2).
+    #[tokio::test]
+    async fn watch_query_rejects_collection_group_queries() {
+        let app = App::new(FirebaseOptions::new("test-key", "test-project"));
+        let firestore =
+            Firestore::new(&app, Arc::new(StubTokens)).with_endpoint("http://127.0.0.1:9");
+        let result = firestore
+            .watch_query("", Query::collection_group("members"))
+            .await;
+        match result {
+            Err(Error::Other(message)) => {
+                assert!(message.contains("cannot be listened"), "{message}")
+            }
+            Ok(_) => panic!("expected a rejection, got a listener"),
+            Err(other) => panic!("expected Error::Other, got {other:?}"),
+        }
+    }
+
+    /// A fake Firestore server speaking just enough gRPC
+    /// (HTTP/2 + the RunQuery method) to answer `run_query`
+    /// with canned documents. The crate generates client-only
+    /// protos (`build_server(false)`), so tests drive the h2
+    /// layer directly. `canned` is read per request, so a test
+    /// can change what the "server" returns between calls;
+    /// `captured` records the last structured query received.
+    struct FakeRunQueryServer {
+        port: u16,
+        canned: Arc<std::sync::Mutex<Vec<crate::google::firestore::v1::Document>>>,
+        captured: Arc<std::sync::Mutex<Option<crate::google::firestore::v1::StructuredQuery>>>,
+    }
+
+    async fn spawn_fake_run_query_server() -> FakeRunQueryServer {
+        use prost::Message as _;
+        let canned: Arc<std::sync::Mutex<Vec<crate::google::firestore::v1::Document>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: Arc<std::sync::Mutex<Option<crate::google::firestore::v1::StructuredQuery>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_canned = canned.clone();
+        let server_captured = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let canned = server_canned.clone();
+                let captured = server_captured.clone();
+                tokio::spawn(async move {
+                    let mut connection = match h2::server::handshake(socket).await {
+                        Ok(connection) => connection,
+                        Err(_) => return,
+                    };
+                    while let Some(accepted) = connection.accept().await {
+                        let (request, mut respond) = match accepted {
+                            Ok(pair) => pair,
+                            Err(_) => return,
+                        };
+                        let canned = canned.clone();
+                        let captured = captured.clone();
+                        tokio::spawn(async move {
+                            let mut body = request.into_body();
+                            let mut data = Vec::new();
+                            while let Some(chunk) = body.data().await {
+                                let chunk = match chunk {
+                                    Ok(chunk) => chunk,
+                                    Err(_) => return,
+                                };
+                                data.extend_from_slice(&chunk);
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                            }
+                            // One gRPC frame: flag + length + message.
+                            if data.len() > 5 {
+                                if let Ok(run_query) =
+                                    crate::google::firestore::v1::RunQueryRequest::decode(
+                                        &data[5..],
+                                    )
+                                {
+                                    if let Some(
+                                        crate::google::firestore::v1::run_query_request::QueryType::StructuredQuery(
+                                            structured,
+                                        ),
+                                    ) = run_query.query_type
+                                    {
+                                        *captured.lock().unwrap() = Some(structured);
+                                    }
+                                }
+                            }
+                            let headers = http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(())
+                                .unwrap();
+                            let mut send = match respond.send_response(headers, false) {
+                                Ok(send) => send,
+                                Err(_) => return,
+                            };
+                            let documents = canned.lock().unwrap().clone();
+                            for document in documents {
+                                let response = crate::google::firestore::v1::RunQueryResponse {
+                                    document: Some(document),
+                                    ..Default::default()
+                                };
+                                let mut payload = Vec::new();
+                                response.encode(&mut payload).unwrap();
+                                let mut frame = Vec::with_capacity(5 + payload.len());
+                                frame.push(0u8);
+                                frame.extend_from_slice(
+                                    &u32::try_from(payload.len()).unwrap().to_be_bytes(),
+                                );
+                                frame.extend_from_slice(&payload);
+                                if send.send_data(bytes::Bytes::from(frame), false).is_err() {
+                                    return;
+                                }
+                            }
+                            let mut trailers = http::HeaderMap::new();
+                            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                            let _ = send.send_trailers(trailers);
+                        });
+                    }
+                });
+            }
+        });
+        FakeRunQueryServer {
+            port,
+            canned,
+            captured,
+        }
+    }
+
+    fn proto_document(name: &str, uid: &str) -> crate::google::firestore::v1::Document {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "uid".to_string(),
+            crate::google::firestore::v1::Value {
+                value_type: Some(crate::google::firestore::v1::value::ValueType::StringValue(
+                    uid.to_string(),
+                )),
+            },
+        );
+        crate::google::firestore::v1::Document {
+            name: name.to_string(),
+            fields,
+            create_time: None,
+            update_time: None,
+        }
+    }
+
+    fn persistent_firestore(endpoint: &str, tag: &str) -> (Firestore, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("firebase-native-{tag}-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("store.db");
+        let _ = std::fs::remove_file(&store_path);
+        let app = App::new(FirebaseOptions::new("test-key", "test-project"));
+        let firestore = Firestore::new(&app, Arc::new(StubTokens))
+            .with_endpoint(endpoint.to_string())
+            .enable_local_store(&store_path)
+            .unwrap();
+        (firestore, dir)
+    }
+
+    /// The group answer comes from what the server returned,
+    /// not from the wider cache (issue #31 review): a cached
+    /// member the server no longer returns must not reappear,
+    /// and a member only the server has is the answer.
+    #[tokio::test]
+    async fn group_query_answer_comes_from_the_server_result_not_the_cache() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) =
+            persistent_firestore(&format!("http://127.0.0.1:{}", server.port), "group-answer");
+        let engine = firestore.engine.clone().unwrap();
+        // Cache a matching member the server has since deleted.
+        engine
+            .store_remote_document(&crate::value::Document {
+                name: "projects/test-project/databases/(default)/documents/a/1/members/x"
+                    .to_string(),
+                fields: {
+                    let mut fields = crate::Fields::new();
+                    fields.insert("uid".to_string(), Value::String("u1".to_string()));
+                    fields
+                },
+                create_time: None,
+                update_time: None,
+            })
+            .unwrap();
+        let query = Query::collection_group("members").filter(crate::query::Filter::eq(
+            "uid",
+            Value::String("u1".to_string()),
+        ));
+
+        // The server returns nothing: the answer is empty,
+        // however well the stale cached copy matches.
+        let results = firestore.run_query("", query.clone()).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "stale cached member reappeared: {results:?}"
+        );
+        let captured = server.captured.lock().unwrap().clone().unwrap();
+        assert!(captured.from[0].all_descendants);
+
+        // The server returns a member the cache has never
+        // seen: that, exactly, is the answer.
+        *server.canned.lock().unwrap() = vec![proto_document(
+            "projects/test-project/databases/(default)/documents/b/2/members/y",
+            "u1",
+        )];
+        let results = firestore.run_query("", query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.ends_with("b/2/members/y"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With nothing pending in the group, the fetch keeps
+    /// the query's limit (issue #31 review nit); with a
+    /// pending write in scope it goes unpaginated and the
+    /// limit applies to the composed answer.
+    #[tokio::test]
+    async fn group_query_keeps_its_limit_unless_writes_are_pending() {
+        let server = spawn_fake_run_query_server().await;
+        let (firestore, dir) =
+            persistent_firestore(&format!("http://127.0.0.1:{}", server.port), "group-limit");
+        let query = Query::collection_group("members").limit(1);
+
+        let results = firestore.run_query("", query.clone()).await.unwrap();
+        assert!(results.is_empty());
+        let captured = server.captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            captured.limit,
+            Some(1),
+            "no pending writes: the limit belongs on the wire"
+        );
+
+        // Queue a write inside the group: now the answer is
+        // composed locally, so the fetch must not carry the
+        // limit — and the composed answer still honours it.
+        let engine = firestore.engine.clone().unwrap();
+        let mut fields = crate::Fields::new();
+        fields.insert("uid".to_string(), Value::String("u9".to_string()));
+        engine
+            .store()
+            .enqueue_batch(&[crate::mutation::Mutation::Set {
+                path: "c/3/members/z".to_string(),
+                fields,
+                merge_paths: None,
+                exists: None,
+                transforms: Vec::new(),
+            }])
+            .unwrap();
+        let results = firestore.run_query("", query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].name.ends_with("c/3/members/z"));
+        let captured = server.captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            captured.limit, None,
+            "pending writes: the fetch is unpaginated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group query with a non-empty parent is refused
+    /// before anything is sent: the server only allows
+    /// collection group queries at the root parent.
+    #[tokio::test]
+    async fn group_query_requires_the_root_parent() {
+        let app = App::new(FirebaseOptions::new("test-key", "test-project"));
+        let firestore =
+            Firestore::new(&app, Arc::new(StubTokens)).with_endpoint("http://127.0.0.1:9");
+        let result = firestore
+            .run_query("a/1", Query::collection_group("members"))
+            .await;
+        match result {
+            Err(Error::InvalidArgument(message)) => {
+                assert!(message.contains("root parent"), "{message}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     struct StubTokens;

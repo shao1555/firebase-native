@@ -1,9 +1,12 @@
 //! A basic structured query builder for `run_query` (P0 scope).
 //!
 //! Mirrors a subset of the Firestore `StructuredQuery` proto: a single
-//! collection, field/unary filters combined with AND, ordering, limit
-//! and offset. Composite (AND/OR) filters, cursors and collection-group
-//! queries arrive with the fuller query work in later phases.
+//! collection (or, with [`Query::collection_group`], every collection
+//! of one ID at any depth), field/unary filters combined with AND,
+//! ordering, limit and offset. Composite (AND/OR) filters and cursors
+//! arrive with the fuller query work in later phases. Listening to a
+//! collection-group query is not supported yet: `watch_query` rejects
+//! one rather than track only part of the group.
 
 use crate::google::firestore::v1::structured_query::Direction;
 use crate::google::firestore::v1::{
@@ -239,10 +242,14 @@ fn field_reference(path: &str) -> crate::google::firestore::v1::structured_query
     }
 }
 
-/// A structured query against a single collection.
+/// A structured query against a single collection, or — built
+/// with [`Query::collection_group`] — against every collection
+/// with the same ID at any depth below the query's parent (a
+/// collection group).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     collection_id: String,
+    all_descendants: bool,
     filters: Vec<Filter>,
     orders: Vec<Order>,
     limit: Option<i32>,
@@ -416,11 +423,43 @@ impl Query {
     pub fn new(collection_id: impl Into<String>) -> Self {
         Self {
             collection_id: collection_id.into(),
+            all_descendants: false,
             filters: Vec::new(),
             orders: Vec::new(),
             limit: None,
             offset: None,
         }
+    }
+
+    /// Starts a collection-group query: every collection whose
+    /// ID is `collection_id`, at any depth below the database
+    /// root. This is the query shape for per-user
+    /// subcollections that appear all over the tree — every
+    /// `members` collection, say — filtered by a field such
+    /// as the user's ID. The parent passed to `run_query`
+    /// must be empty: the server only allows collection group
+    /// queries at the root parent (the emulator rejects a
+    /// document parent, and the official SDKs expose no
+    /// scoped form), and `run_query` refuses a non-empty
+    /// parent for a group query instead of sending it.
+    ///
+    /// One-shot only for now: `run_query` runs it (with the
+    /// local store on it always asks the server first — no
+    /// single cached collection stands for the group — and
+    /// falls back to a local evaluation over the cached group
+    /// members on a connectivity error), while `watch_query`
+    /// rejects it until listeners learn group matching.
+    pub fn collection_group(collection_id: impl Into<String>) -> Self {
+        Self {
+            all_descendants: true,
+            ..Self::new(collection_id)
+        }
+    }
+
+    /// Whether this is a collection-group query (its `from`
+    /// selector carries `all_descendants`).
+    pub(crate) fn is_collection_group(&self) -> bool {
+        self.all_descendants
     }
 
     /// Adds a filter (filters combine with AND).
@@ -517,7 +556,7 @@ impl Query {
             from: vec![
                 crate::google::firestore::v1::structured_query::CollectionSelector {
                     collection_id: self.collection_id.clone(),
-                    all_descendants: false,
+                    all_descendants: self.all_descendants,
                 },
             ],
             r#where: filter,
@@ -570,6 +609,19 @@ mod tests {
             ) => assert_eq!(composite.filters.len(), 2),
             other => panic!("unexpected filter type: {other:?}"),
         }
+    }
+
+    #[test]
+    fn collection_group_sets_all_descendants() {
+        let query = Query::collection_group("members")
+            .filter(Filter::eq("uid", Value::String("u1".to_string())));
+        assert!(query.is_collection_group());
+        let proto = query.to_proto();
+        assert_eq!(proto.from.len(), 1);
+        assert_eq!(proto.from[0].collection_id, "members");
+        assert!(proto.from[0].all_descendants);
+        // A plain query is not a group query.
+        assert!(!Query::new("members").is_collection_group());
     }
 
     #[test]
