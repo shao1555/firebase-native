@@ -126,9 +126,16 @@ Two differences from single-collection queries:
   fetch keeps the query's limit and offset; when writes
   are pending it goes unpaginated and the composition
   applies them exactly once.
-- Listeners do not support group queries yet:
-  `watch_query` rejects one with an error instead of
-  tracking only part of the group.
+- Listeners support group queries too:
+  `watch_query("", group)` delivers snapshots as members
+  are added, changed or removed anywhere in the group.
+  With the local store on, the watch seeds from the
+  cached group members across the tree, and its
+  pending-writes flag covers queued writes in any branch
+  of the group. (A group watch does not mark any single
+  collection as fully synced for the cache bookkeeping —
+  it establishes the group's contents, not one
+  collection's.)
 
 ## Watches and snapshot metadata
 

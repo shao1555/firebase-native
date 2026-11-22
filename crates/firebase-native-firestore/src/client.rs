@@ -308,9 +308,12 @@ impl Firestore {
         parent_path: &str,
         query: Query,
     ) -> Result<crate::listen::Listener> {
-        if query.is_collection_group() {
-            return Err(Error::Other(
-                "collection-group queries cannot be listened to yet".to_string(),
+        if query.is_collection_group() && !parent_path.is_empty() {
+            // Same root-only rule as `run_query`: the server
+            // only allows collection group targets at the root
+            // parent.
+            return Err(Error::InvalidArgument(
+                "collection group queries are only allowed at the root parent".to_string(),
             ));
         }
         let parent = if parent_path.is_empty() {
@@ -1688,22 +1691,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Listeners reject collection-group queries until they
-    /// learn group matching (issue #31, step 2).
+    /// A collection-group watch is accepted at the root and
+    /// refused under a document parent, like `run_query`
+    /// (issue #31, step 2). The endpoint is dead: acceptance
+    /// is what is checked here — the listener's driver
+    /// retries in the background.
     #[tokio::test]
-    async fn watch_query_rejects_collection_group_queries() {
+    async fn watch_query_accepts_collection_group_at_the_root_only() {
         let app = App::new(FirebaseOptions::new("test-key", "test-project"));
         let firestore =
             Firestore::new(&app, Arc::new(StubTokens)).with_endpoint("http://127.0.0.1:9");
-        let result = firestore
+        let listener = firestore
             .watch_query("", Query::collection_group("members"))
             .await;
+        assert!(listener.is_ok(), "the group watch was refused");
+        let result = firestore
+            .watch_query("a/1", Query::collection_group("members"))
+            .await;
         match result {
-            Err(Error::Other(message)) => {
-                assert!(message.contains("cannot be listened"), "{message}")
+            Err(Error::InvalidArgument(message)) => {
+                assert!(message.contains("root parent"), "{message}")
             }
-            Ok(_) => panic!("expected a rejection, got a listener"),
-            Err(other) => panic!("expected Error::Other, got {other:?}"),
+            Ok(_) => panic!("expected a refusal, got a listener"),
+            Err(other) => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 

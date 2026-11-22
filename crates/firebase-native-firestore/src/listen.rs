@@ -949,8 +949,11 @@ impl StoreWatch {
                 // Only a sync covering the *entire* collection
                 // re-establishes its completeness: a filtered
                 // or windowed watch legitimately never sees
-                // the documents eviction may have taken.
-                if query.covers_entire_collection() {
+                // the documents eviction may have taken. A
+                // group sync establishes the *group's* contents
+                // across many collections; it is not recorded
+                // as any one collection's completeness.
+                if !query.is_collection_group() && query.covers_entire_collection() {
                     self.engine
                         .note_collection_synced(parent_relative, query.collection_id());
                 }
@@ -1024,11 +1027,16 @@ impl StoreWatch {
                         .relative_path_of(&document.name)
                         .is_some_and(|relative| self.engine.has_pending(relative).unwrap_or(false))
                 });
-                in_view
-                    || self
-                        .engine
+                let in_scope = if query.is_collection_group() {
+                    self.engine
+                        .has_pending_in_group(parent_relative, query.collection_id())
+                        .unwrap_or(false)
+                } else {
+                    self.engine
                         .has_pending_in_collection(parent_relative, query.collection_id())
                         .unwrap_or(false)
+                };
+                in_view || in_scope
             }
         }
     }
@@ -3592,6 +3600,138 @@ mod tests {
             42,
         );
         (engine, watch)
+    }
+
+    fn group_store_watch(engine: &Arc<PersistenceEngine>) -> StoreWatch {
+        StoreWatch::new(
+            engine.clone(),
+            WatchSource::Query {
+                parent_relative: String::new(),
+                query: Query::collection_group("members"),
+            },
+            43,
+        )
+    }
+
+    /// A group watch seeds its view from members across the
+    /// whole tree (issue #31, step 2): the composed view is
+    /// the engine's group evaluation.
+    #[test]
+    fn group_watch_seeds_members_from_across_the_tree() {
+        let (engine, _watch) = test_store_watch();
+        for (path, n) in [
+            ("members/top", 1),
+            ("a/1/members/x", 2),
+            ("b/2/c/3/members/y", 3),
+            ("a/1/others/w", 4),
+            ("a/1/membership/z", 5),
+        ] {
+            engine.store_remote_document(&stored_doc(path, n)).unwrap();
+        }
+        let group_watch = group_store_watch(&engine);
+        let mut state = watch();
+        let seeded = group_watch.seed(&mut state);
+        let mut names: Vec<&str> = seeded
+            .iter()
+            .map(|document| document.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                format!("{PREFIX}/a/1/members/x").as_str(),
+                format!("{PREFIX}/b/2/c/3/members/y").as_str(),
+                format!("{PREFIX}/members/top").as_str(),
+            ]
+        );
+    }
+
+    /// The pending-writes flag of a group watch covers
+    /// queued writes anywhere in the group; a
+    /// single-collection watch over the root `members`
+    /// collection does not see a write in a nested one.
+    #[test]
+    fn group_watch_pending_writes_span_the_group() {
+        let (engine, notes_watch) = test_store_watch();
+        let group_watch = group_store_watch(&engine);
+        assert!(!group_watch.has_pending_writes(&[]));
+        engine
+            .store()
+            .enqueue_batch(&[crate::mutation::Mutation::Set {
+                path: "b/2/members/y".to_string(),
+                fields: Fields::new(),
+                merge_paths: None,
+                exists: None,
+                transforms: Vec::new(),
+            }])
+            .unwrap();
+        assert!(
+            group_watch.has_pending_writes(&[]),
+            "a queued write in another branch of the group must set the flag"
+        );
+        // The plain `notes` watch from the helper is unaffected.
+        assert!(!notes_watch.has_pending_writes(&[]));
+        // And a watch on the root `members` collection alone
+        // does not see the nested write either: its scope is
+        // the one concrete collection.
+        let root_members_watch = StoreWatch::new(
+            engine.clone(),
+            WatchSource::Query {
+                parent_relative: String::new(),
+                query: Query::new("members"),
+            },
+            44,
+        );
+        assert!(!root_members_watch.has_pending_writes(&[]));
+    }
+
+    /// A group sync does not re-establish any one
+    /// collection's completeness (the GC bookkeeping stays
+    /// honest), while an entire-collection sync does.
+    #[test]
+    fn group_sync_does_not_establish_collection_completeness() {
+        let store = Arc::new(crate::store::LocalStore::open_in_memory().unwrap());
+        store
+            .put_remote_document(&stored_doc("members/x", 1))
+            .unwrap();
+        // Evict it: its collection is now known-partial.
+        store.evict_lru_batch(PREFIX, u64::MAX).unwrap();
+        assert!(store.collection_incomplete("members").unwrap());
+
+        let options = FirebaseOptions::new("test-key", "p");
+        let write = crate::write::WriteStream::new(
+            options,
+            Arc::new(StubTokens),
+            Arc::new(crate::client::SharedChannel::new()),
+            "https://firestore.googleapis.com".to_string(),
+        );
+        let engine = Arc::new(PersistenceEngine::new(
+            store.clone(),
+            write,
+            PREFIX.to_string(),
+        ));
+        let view = vec![stored_doc("members/x", 1)];
+
+        let group_watch = group_store_watch(&engine);
+        group_watch.sync_membership(&view, true);
+        assert!(
+            store.collection_incomplete("members").unwrap(),
+            "a group sync must not clear a collection's incomplete mark"
+        );
+
+        let single_watch = StoreWatch::new(
+            engine.clone(),
+            WatchSource::Query {
+                parent_relative: String::new(),
+                query: Query::new("members"),
+            },
+            45,
+        );
+        single_watch.sync_membership(&view, true);
+        assert!(
+            !store.collection_incomplete("members").unwrap(),
+            "an entire-collection sync clears the mark, as before"
+        );
     }
 
     #[test]
