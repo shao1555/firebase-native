@@ -4,9 +4,7 @@
 //! collection (or, with [`Query::collection_group`], every collection
 //! of one ID at any depth), field/unary filters combined with AND,
 //! ordering, limit and offset. Composite (AND/OR) filters and cursors
-//! arrive with the fuller query work in later phases. Listening to a
-//! collection-group query is not supported yet: `watch_query` rejects
-//! one rather than track only part of the group.
+//! arrive with the fuller query work in later phases.
 
 use crate::google::firestore::v1::structured_query::Direction;
 use crate::google::firestore::v1::{
@@ -443,12 +441,14 @@ impl Query {
     /// scoped form), and `run_query` refuses a non-empty
     /// parent for a group query instead of sending it.
     ///
-    /// One-shot only for now: `run_query` runs it (with the
-    /// local store on it always asks the server first — no
-    /// single cached collection stands for the group — and
-    /// falls back to a local evaluation over the cached group
-    /// members on a connectivity error), while `watch_query`
-    /// rejects it until listeners learn group matching.
+    /// Both one-shot queries and listeners run it:
+    /// `run_query` (with the local store on it always asks the
+    /// server first — no single cached collection stands for
+    /// the group — and falls back to a local evaluation over
+    /// the cached group members on a connectivity error), and
+    /// `watch_query`, whose snapshots track members added,
+    /// changed or removed anywhere in the group. The
+    /// root-parent rule above applies to both entry points.
     pub fn collection_group(collection_id: impl Into<String>) -> Self {
         Self {
             all_descendants: true,
